@@ -51,16 +51,20 @@ class BinaryState:
         return BinaryState(instances=self.instances, chunk=next_chunk, index=0)
 
 
-def collect_batch(
-    state: BinaryState, n: int
-) -> tuple[list[BinaryState], "BinaryState | None"]:
-    """Collect up to n states from the current position, return (batch, next_state)."""
-    batch: list[BinaryState] = []
-    s: BinaryState | None = state
-    while s is not None and len(batch) < n:
-        batch.append(s)
+def _state_iter(state: "BinaryState | None"):
+    """Yield every BinaryState in sequence.
+
+    The sequence tries the largest chunks first, then progressively halves:
+      [0:N], [0:N/2], [N/2:N], [0:N/4], [N/4:N/2], [N/2:3N/4], [3N/4:N], ...
+
+    With N persistent workers pulling from this iterator, round 1 launches:
+      worker 0 → chunk=all, worker 1 → chunk=first-half,
+      worker 2 → chunk=second-half, worker 3 → chunk=first-quarter.
+    """
+    s = state
+    while s is not None:
+        yield s
         s = s.advance()
-    return batch, s
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +86,10 @@ def git(
 
 def git_ls_files(repo: Path) -> list[str]:
     result = git(["ls-files"], cwd=repo)
-    return [f for f in result.stdout.splitlines() if f]
+    # Sort so that files in the same directory are contiguous. Binary-search
+    # chunks then tend to cover whole directories, making early deletions more
+    # likely to be interesting.
+    return sorted(f for f in result.stdout.splitlines() if f)
 
 
 def create_worktrees(repo: Path, n: int, parent: Path) -> list[Path]:
@@ -183,88 +190,35 @@ def is_text_file(path: Path) -> bool:
 
 
 def resolve_command(cmd: str, repo: Path, tempdir: Path) -> str:
-    """If cmd starts with a path to a file inside repo, copy it outside and rewrite cmd."""
+    """Absolutize the script path in cmd and, if it lives inside the repo, copy it out.
+
+    Relative paths are resolved against the caller's CWD (not the repo), so that
+    e.g. `./interesting.sh` works even when the test later runs from a worktree.
+    """
     first = cmd.split()[0]
-    candidate = (
-        (repo / first).resolve()
-        if not Path(first).is_absolute()
-        else Path(first).resolve()
-    )
+    # Resolve relative to caller's CWD so the path survives cwd changes
+    if Path(first).is_absolute():
+        candidate = Path(first).resolve()
+    else:
+        candidate = (Path.cwd() / first).resolve()
+
+    if not candidate.is_file():
+        return cmd  # not a file path (shell builtin, env var, etc.)
+
     try:
         is_inside = candidate.is_relative_to(repo.resolve())
     except ValueError:
         is_inside = False
-    if is_inside and candidate.is_file():
+
+    if is_inside:
+        # Copy outside the repo so Phase 1 can't delete it
         safe_copy = tempdir / "interestingness-test.sh"
         shutil.copy2(candidate, safe_copy)
         safe_copy.chmod(safe_copy.stat().st_mode | 0o111)
         return str(safe_copy) + cmd[len(first) :]
-    return cmd
 
-
-# ---------------------------------------------------------------------------
-# Workers
-# ---------------------------------------------------------------------------
-
-
-def _test_file_deletion_worker(
-    wt: Path,
-    state: BinaryState,
-    files: list[str],
-    cmd: str,
-    stop_event: threading.Event,
-    results: list,
-    lock: threading.Lock,
-) -> None:
-    if stop_event.is_set():
-        return
-
-    # Delete the slice of files described by state
-    to_delete = files[state.index : state.end()]
-    for f in to_delete:
-        path = wt / f
-        path.unlink(missing_ok=True)
-
-    interesting = run_test(cmd, wt, stop_event)
-
-    if interesting:
-        with lock:
-            if not stop_event.is_set():
-                stop_event.set()
-                results.append((wt, state, to_delete))
-                return  # leave worktree dirty; caller will commit
-    # Either not interesting or lost the race
-    restore_worktree(wt)
-
-
-def _test_line_deletion_worker(
-    wt: Path,
-    filepath: str,
-    state: BinaryState,
-    lines: list[str],
-    cmd: str,
-    stop_event: threading.Event,
-    results: list,
-    lock: threading.Lock,
-) -> None:
-    if stop_event.is_set():
-        restore_worktree(wt)
-        return
-
-    # Write the file with the slice of lines removed
-    remaining = lines[: state.index] + lines[state.end() :]
-    target = wt / filepath
-    target.write_text("".join(remaining))
-
-    interesting = run_test(cmd, wt, stop_event)
-
-    if interesting:
-        with lock:
-            if not stop_event.is_set():
-                stop_event.set()
-                results.append((wt, state, remaining))
-                return  # leave worktree dirty; caller will commit
-    restore_worktree(wt)
+    # Outside the repo: just ensure the path is absolute
+    return str(candidate) + cmd[len(first) :]
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +226,7 @@ def _test_line_deletion_worker(
 # ---------------------------------------------------------------------------
 
 
-def reduce_files(files: list[str], worktrees: list[Path], cmd: str) -> list[str]:
+def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> list[str]:
     """Delete whole files until no further reduction is possible. Returns reduced file list."""
     n = len(worktrees)
 
@@ -281,45 +235,50 @@ def reduce_files(files: list[str], worktrees: list[Path], cmd: str) -> list[str]
         if state is None:
             break
 
-        progress = False
-        # Iterate over all BinaryState candidates
-        while state is not None:
-            batch, next_state_after_batch = collect_batch(state, n)
+        _it = _state_iter(state)
+        _it_lock = threading.Lock()
 
-            stop_event = threading.Event()
-            results: list = []
-            lock = threading.Lock()
+        def _next():
+            with _it_lock:
+                return next(_it, None)
 
-            threads = []
-            batch_states = batch
-            for i, s in enumerate(batch_states):
-                wt = worktrees[i % n]
-                t = threading.Thread(
-                    target=_test_file_deletion_worker,
-                    args=(wt, s, files, cmd, stop_event, results, lock),
-                )
-                threads.append(t)
+        stop_event = threading.Event()
+        results: list = []
+        results_lock = threading.Lock()
 
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+        def worker(wt, i):
+            while not stop_event.is_set():
+                s = _next()
+                if s is None:
+                    return
+                to_delete = files[s.index : s.end()]
+                names = ", ".join(to_delete[:3]) + ("..." if len(to_delete) > 3 else "")
+                print(f"  [worker {i}] delete {len(to_delete)} file(s): {names}")
+                for f in to_delete:
+                    (wt / f).unlink(missing_ok=True)
+                interesting = run_test(cmd, wt, stop_event)
+                if interesting:
+                    with results_lock:
+                        if not stop_event.is_set():
+                            stop_event.set()
+                            results.append((wt, to_delete))
+                            return  # leave dirty; caller commits
+                restore_worktree(wt)
 
-            if results:
-                winning_wt, _winning_state, deleted = results[0]
-                deleted_set = set(deleted)
-                files = [f for f in files if f not in deleted_set]
-                msg = f"reduce: delete {len(deleted)} file(s): {', '.join(deleted[:3])}{'...' if len(deleted) > 3 else ''}"
-                print(f"[+] {msg}")
-                commit_hash = commit_change(winning_wt, msg)
-                sync_worktrees_to_commit(commit_hash, worktrees)
-                progress = True
-                break  # restart outer loop with new file list
-            else:
-                # Advance to next batch
-                state = next_state_after_batch
+        threads = [threading.Thread(target=worker, args=(worktrees[i], i)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-        if not progress:
+        if results:
+            winning_wt, deleted = results[0]
+            files = [f for f in files if f not in set(deleted)]
+            msg = f"reduce: delete {len(deleted)} file(s): {', '.join(deleted[:3])}{'...' if len(deleted) > 3 else ''}"
+            print(f"[+] {msg}")
+            commit_hash = commit_change(winning_wt, msg)
+            sync_worktrees_to_commit(commit_hash, [repo] + worktrees)
+        else:
             break
 
     return files
@@ -330,7 +289,7 @@ def reduce_files(files: list[str], worktrees: list[Path], cmd: str) -> list[str]
 # ---------------------------------------------------------------------------
 
 
-def reduce_lines(files: list[str], worktrees: list[Path], cmd: str) -> None:
+def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> None:
     """For each file, delete lines until no further reduction is possible."""
     n = len(worktrees)
 
@@ -351,42 +310,48 @@ def reduce_lines(files: list[str], worktrees: list[Path], cmd: str) -> None:
             if state is None:
                 break
 
-            progress = False
+            _it = _state_iter(state)
+            _it_lock = threading.Lock()
 
-            while state is not None:
-                batch, next_state_after_batch = collect_batch(state, n)
+            def _next():
+                with _it_lock:
+                    return next(_it, None)
 
-                stop_event = threading.Event()
-                results: list = []
-                lock = threading.Lock()
+            stop_event = threading.Event()
+            results: list = []
+            results_lock = threading.Lock()
 
-                threads = []
-                for i, s in enumerate(batch):
-                    wt = worktrees[i % n]
-                    t = threading.Thread(
-                        target=_test_line_deletion_worker,
-                        args=(wt, filepath, s, lines, cmd, stop_event, results, lock),
-                    )
-                    threads.append(t)
+            def worker(wt, i):
+                while not stop_event.is_set():
+                    s = _next()
+                    if s is None:
+                        return
+                    print(f"  [worker {i}] remove {s.end() - s.index} line(s) at [{s.index}:{s.end()}]")
+                    remaining = lines[: s.index] + lines[s.end() :]
+                    (wt / filepath).write_text("".join(remaining))
+                    interesting = run_test(cmd, wt, stop_event)
+                    if interesting:
+                        with results_lock:
+                            if not stop_event.is_set():
+                                stop_event.set()
+                                results.append((wt, s, remaining))
+                                return
+                    restore_worktree(wt)
 
-                for t in threads:
-                    t.start()
-                for t in threads:
-                    t.join()
+            threads = [threading.Thread(target=worker, args=(worktrees[i], i)) for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
 
-                if results:
-                    winning_wt, winning_state, remaining = results[0]
-                    removed = len(lines) - len(remaining)
-                    msg = f"reduce: {filepath}: remove {removed} line(s) at [{winning_state.index}:{winning_state.end()}]"
-                    print(f"[+] {msg}")
-                    commit_hash = commit_change(winning_wt, msg)
-                    sync_worktrees_to_commit(commit_hash, worktrees)
-                    progress = True
-                    break
-                else:
-                    state = next_state_after_batch
-
-            if not progress:
+            if results:
+                winning_wt, winning_state, remaining = results[0]
+                removed = len(lines) - len(remaining)
+                msg = f"reduce: {filepath}: remove {removed} line(s) at [{winning_state.index}:{winning_state.end()}]"
+                print(f"[+] {msg}")
+                commit_hash = commit_change(winning_wt, msg)
+                sync_worktrees_to_commit(commit_hash, [repo] + worktrees)
+            else:
                 break
 
 
@@ -483,31 +448,21 @@ def main() -> None:
 
         print(f"[*] Creating {n} git worktrees...")
         worktrees = create_worktrees(repo, n, parent)
-        final_hash: str | None = None
 
         try:
             # Phase 1: file deletion
             print("\n[*] Phase 1: reducing files...")
-            files = reduce_files(files, worktrees, cmd)
+            files = reduce_files(files, repo, worktrees, cmd)
             print(f"[*] Phase 1 done. Files remaining: {len(files)}")
 
             # Phase 2: line deletion
             print("\n[*] Phase 2: reducing lines...")
-            reduce_lines(files, worktrees, cmd)
+            reduce_lines(files, repo, worktrees, cmd)
             print("[*] Phase 2 done.")
-
-            # Capture final commit before tearing down worktrees
-            final_hash = git(["rev-parse", "HEAD"], cwd=worktrees[0]).stdout.strip()
 
         finally:
             print(f"\n[*] Removing worktrees...")
             remove_worktrees(repo, worktrees)
-
-        # Fast-forward the main repo's branch to the reduced commit
-        if final_hash:
-            subprocess.run(
-                ["git", "reset", "--hard", final_hash], cwd=repo, capture_output=True
-            )
 
         print("\n[*] Reduction complete. Commits:")
         subprocess.run(["git", "log", "--oneline", "-20"], cwd=repo)
