@@ -8,6 +8,7 @@ Each successful reduction is committed so the git history records progress.
 """
 
 import argparse
+import random
 import secrets
 import shutil
 import subprocess
@@ -15,7 +16,9 @@ import sys
 import tempfile
 import threading
 from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
+import time
 
 
 # ---------------------------------------------------------------------------
@@ -39,31 +42,38 @@ class BinaryState:
         return min(self.index + self.chunk, self.instances)
 
     def advance(self) -> "BinaryState | None":
-        next_index = self.index + self.chunk
-        if next_index < self.instances:
+        # Walk backwards within the current chunk size (end → start).
+        if self.index >= self.chunk:
             return BinaryState(
-                instances=self.instances, chunk=self.chunk, index=next_index
+                instances=self.instances, chunk=self.chunk, index=self.index - self.chunk
             )
-        # wrap around: halve the chunk
+        # Exhausted this chunk size: halve and start from the last chunk.
         next_chunk = self.chunk // 2
         if next_chunk == 0:
             return None
-        return BinaryState(instances=self.instances, chunk=next_chunk, index=0)
+        last_index = ((self.instances - 1) // next_chunk) * next_chunk
+        return BinaryState(instances=self.instances, chunk=next_chunk, index=last_index)
 
 
 def _state_iter(state: "BinaryState | None"):
     """Yield every BinaryState in sequence.
 
-    The sequence tries the largest chunks first, then progressively halves:
-      [0:N], [0:N/2], [N/2:N], [0:N/4], [N/4:N/2], [N/2:3N/4], [3N/4:N], ...
+    The sequence tries the largest chunks first, then progressively halves.
+    Within each chunk size the chunks are tried from the end backwards:
+      [0:N], [N/2:N], [0:N/2], [3N/4:N], [N/2:3N/4], [N/4:N/2], [0:N/4], ...
 
     With N persistent workers pulling from this iterator, round 1 launches:
-      worker 0 → chunk=all, worker 1 → chunk=first-half,
-      worker 2 → chunk=second-half, worker 3 → chunk=first-quarter.
+      worker 0 → chunk=all, worker 1 → chunk=last-half,
+      worker 2 → chunk=first-half, worker 3 → chunk=last-quarter.
     """
     s = state
     while s is not None:
-        yield s
+        # Skip remainder chunks smaller than half the nominal chunk size.
+        # E.g. with 522 files and chunk=128 the tail [512:522] (10 items) is
+        # skipped; a successful deletion there would wastefully restart from
+        # chunk=1024 rather than continuing at the current granularity.
+        if (s.end() - s.index) * 2 >= s.chunk:
+            yield s
         s = s.advance()
 
 
@@ -89,7 +99,7 @@ def git_ls_files(repo: Path) -> list[str]:
     # Sort so that files in the same directory are contiguous. Binary-search
     # chunks then tend to cover whole directories, making early deletions more
     # likely to be interesting.
-    return sorted(f for f in result.stdout.splitlines() if f)
+    return sorted(f for f in result.stdout.splitlines() if f and Path(f).name != ".gitignore")
 
 
 def create_worktrees(repo: Path, n: int, parent: Path) -> list[Path]:
@@ -119,8 +129,7 @@ def restore_worktree(wt: Path) -> None:
 
 
 def commit_change(wt: Path, msg: str) -> str:
-    """Stage all changes and commit. Returns the new commit hash."""
-    git(["add", "-A"], cwd=wt)
+    """Commit what is already staged. Returns the new commit hash."""
     git(["commit", "-m", msg], cwd=wt)
     result = git(["rev-parse", "HEAD"], cwd=wt)
     return result.stdout.strip()
@@ -129,11 +138,8 @@ def commit_change(wt: Path, msg: str) -> str:
 def sync_worktrees_to_commit(commit: str, worktrees: list[Path]) -> None:
     """Reset all worktrees to a specific commit."""
     for wt in worktrees:
-        subprocess.run(
-            ["git", "reset", "--hard", commit],
-            cwd=wt,
-            capture_output=True,
-        )
+        subprocess.run(["git", "reset", "--hard", commit], cwd=wt, capture_output=True)
+        subprocess.run(["git", "clean", "-fd", "."], cwd=wt, capture_output=True)
 
 
 # ---------------------------------------------------------------------------
@@ -146,26 +152,49 @@ def run_test(cmd: str, wt: Path, stop_event: threading.Event) -> bool:
 
     Polls stop_event every 50ms and terminates the subprocess early if set.
     """
-    proc = subprocess.Popen(
-        cmd,
-        shell=True,
-        cwd=wt,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    while True:
-        try:
-            proc.wait(timeout=0.05)
-            break
-        except subprocess.TimeoutExpired:
-            if stop_event.is_set():
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                return False
-    return proc.returncode == 0
+    with tempfile.TemporaryFile(mode='w+') as stdout_f, tempfile.TemporaryFile(mode='w+') as stderr_f:
+        start = time.monotonic()  # ensure monotonic time for timeout
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            cwd=wt,
+            stdout=stdout_f,  # Capture stdout
+            stderr=stderr_f,  # Capture stderr
+            text=True,        # Treat output as text
+            errors="replace", # Don't crash on decoding errors
+        )
+        while True:
+            try:
+                proc.wait(timeout=0.05)
+                break
+            except subprocess.TimeoutExpired:
+                if stop_event.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return False
+
+        if proc.returncode == 0:
+            # Rewind files to read captured output
+            stdout_f.seek(0)
+            stderr_f.seek(0)
+            out = stdout_f.read().strip()
+            err = stderr_f.read().strip()
+
+            # Build a debug message
+            msg = [f"\n--- [SUCCESS] Test passed in {wt.name} in {time.monotonic() - start:.2f}s ---"]
+            if out:
+                msg.append(f"STDOUT:\n{out}")
+            if err:
+                msg.append(f"STDERR:\n{err}")
+            msg.append("------------------------------------------\n")
+            
+            # Print strictly one message at a time to avoid garbled text
+            print("\n".join(msg), flush=True)
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -226,12 +255,21 @@ def resolve_command(cmd: str, repo: Path, tempdir: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> list[str]:
+def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str, restart_after: int = 8) -> list[str]:
     """Delete whole files until no further reduction is possible. Returns reduced file list."""
     n = len(worktrees)
+    successes_since_restart = 0
+    next_chunk: int | None = None
 
     while True:
-        state = BinaryState.create(len(files))
+        if next_chunk is None:
+            state = BinaryState.create(len(files))
+        else:
+            state = BinaryState(
+                instances=len(files),
+                chunk=next_chunk,
+                index=((len(files) - 1) // next_chunk) * next_chunk,
+            )
         if state is None:
             break
 
@@ -256,6 +294,7 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
                 print(f"  [worker {i}] delete {len(to_delete)} file(s): {names}")
                 for f in to_delete:
                     (wt / f).unlink(missing_ok=True)
+                git(["rm", "--cached", "--"] + to_delete, cwd=wt)
                 interesting = run_test(cmd, wt, stop_event)
                 if interesting:
                     with results_lock:
@@ -278,7 +317,19 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
             print(f"[+] {msg}")
             commit_hash = commit_change(winning_wt, msg)
             sync_worktrees_to_commit(commit_hash, [repo] + worktrees)
+            successes_since_restart += 1
+            if successes_since_restart >= restart_after:
+                successes_since_restart = 0
+                next_chunk = None
+            else:
+                next_chunk = max(1, len(deleted))
         else:
+            if next_chunk is not None:
+                # Started mid-sequence; retry from top before declaring done.
+                # The file list changed, so larger chunks might now succeed.
+                successes_since_restart = 0
+                next_chunk = None
+                continue
             break
 
     return files
@@ -289,33 +340,130 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
 # ---------------------------------------------------------------------------
 
 
-def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> None:
-    """For each file, delete lines until no further reduction is possible."""
+def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, restart_after: int = 8, jitter: float = 0.05) -> None:
+    """Delete lines within files until no further reduction is possible.
+
+    Uses depth-major ordering: all files are processed at depth 0 (whole-file
+    removal), then depth 1 (half-file), etc. Within each depth files are sorted
+    largest-first. Multiple concurrent successes are recorded; we try combining
+    them and fall back to the best individual.
+
+    Already-failed (filepath, start, end) triples are remembered in failed_pairs
+    and skipped in subsequent passes. On success, failed_pairs entries for the
+    changed file(s) are cleared so their new content gets a fresh look. After
+    restart_after consecutive successes the entire set is cleared, allowing a
+    coarse-level sweep to find chunks that are newly removable.
+    """
     n = len(worktrees)
+    ref_wt = worktrees[0]
+    failed_pairs: set[tuple[str, int, int]] = set()
+    failed_pairs_lock = threading.Lock()
+    successes_since_restart = 0
 
-    for filepath in files:
-        ref_wt = worktrees[0]
-        full_path = ref_wt / filepath
+    while True:
+        # Build per-file line lists (skip empty / binary / missing)
+        file_lines: dict[str, list[str]] = {}
+        for filepath in files:
+            full_path = ref_wt / filepath
+            if not full_path.exists() or not is_text_file(full_path):
+                continue
+            try:
+                lines = full_path.read_text().splitlines(keepends=True)
+            except UnicodeDecodeError:
+                continue
+            if lines:
+                file_lines[filepath] = lines
 
-        if not full_path.exists() or not is_text_file(full_path):
-            continue
+        if not file_lines:
+            break
 
-        print(f"[*] Reducing lines in {filepath}")
+        # Blank-line pass: delete all blank/whitespace-only lines at once.
+        blank_deletions: dict[str, list[int]] = {}
+        for filepath, lines in file_lines.items():
+            idxs = [i for i, ln in enumerate(lines) if not ln.strip()]
+            if idxs:
+                blank_deletions[filepath] = idxs
 
-        while True:
-            # Re-read lines from the reference worktree (always at HEAD)
-            lines = full_path.read_text().splitlines(keepends=True)
+        if blank_deletions:
+            apply_wt = worktrees[0]
+            for fp, idxs in blank_deletions.items():
+                idx_set = set(idxs)
+                new_lines = [ln for i, ln in enumerate(file_lines[fp]) if i not in idx_set]
+                (apply_wt / fp).write_text("".join(new_lines))
+                git(["add", "--", fp], cwd=apply_wt)
+            total = sum(len(v) for v in blank_deletions.values())
+            print(f"  [blank pass] {total} blank line(s) across {len(blank_deletions)} file(s)")
+            dummy = threading.Event()
+            if run_test(cmd, apply_wt, dummy):
+                msg = f"reduce: remove {total} blank line(s)"
+                print(f"[+] {msg}")
+                commit_hash = commit_change(apply_wt, msg)
+                sync_worktrees_to_commit(commit_hash, [repo] + worktrees)
+                changed = set(blank_deletions)
+                failed_pairs -= {k for k in failed_pairs if k[0] in changed}
+                successes_since_restart += 1
+                if successes_since_restart >= restart_after:
+                    successes_since_restart = 0
+                    failed_pairs.clear()
+                continue  # restart outer loop; re-read file_lines
+            else:
+                restore_worktree(apply_wt)
 
-            state = BinaryState.create(len(lines))
-            if state is None:
-                break
+        # Sort files largest-first so the most impactful deletions appear first.
+        sorted_files = sorted(file_lines, key=lambda fp: len(file_lines[fp]), reverse=True)
 
-            _it = _state_iter(state)
-            _it_lock = threading.Lock()
+        # Build per-file depth groups: list of [states] per depth level.
+        file_depth_groups: dict[str, list[list]] = {}
+        for filepath in sorted_files:
+            lines = file_lines[filepath]
+            s0 = BinaryState.create(len(lines))
+            s0 = s0.advance() if s0 is not None else None  # start at N/2, not N
+            groups = [
+                list(grp)
+                for _, grp in groupby(
+                    _state_iter(s0), key=lambda s: s.chunk
+                )
+            ]
+            file_depth_groups[filepath] = groups
+
+        found = False
+        for depth in range(64):
+            # Build task list for this depth across all files (largest-first),
+            # skipping (filepath, start, end) triples that already failed.
+            task_list = []
+            has_any_at_depth = False
+            for filepath in sorted_files:
+                groups = file_depth_groups[filepath]
+                if depth < len(groups):
+                    has_any_at_depth = True
+                    lines = file_lines[filepath]
+                    for s in groups[depth]:
+                        raw_end = s.end()
+                        chunk_size = raw_end - s.index
+                        if jitter > 0 and chunk_size > 1:
+                            delta = round(chunk_size * random.uniform(-jitter, jitter))
+                            end = max(s.index + 1, min(len(lines), raw_end + delta))
+                        else:
+                            end = raw_end
+                        # heuristic, class Foo is typically in the first 10 lines.
+                        if s.index == 0 and end > 10:
+                            continue
+                        key = (filepath, s.index, end)
+                        if key not in failed_pairs:
+                            task_list.append((filepath, s.index, end, lines))
+
+            if not has_any_at_depth:
+                break  # all depths exhausted — nothing more to try
+
+            if not task_list:
+                continue  # every task at this depth already failed; try next depth
+
+            task_iter = iter(task_list)
+            task_iter_lock = threading.Lock()
 
             def _next():
-                with _it_lock:
-                    return next(_it, None)
+                with task_iter_lock:
+                    return next(task_iter, None)
 
             stop_event = threading.Event()
             results: list = []
@@ -323,19 +471,24 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
 
             def worker(wt, i):
                 while not stop_event.is_set():
-                    s = _next()
-                    if s is None:
+                    task = _next()
+                    if task is None:
                         return
-                    print(f"  [worker {i}] remove {s.end() - s.index} line(s) at [{s.index}:{s.end()}]")
-                    remaining = lines[: s.index] + lines[s.end() :]
+                    filepath, start, end, lines = task
+                    remaining = lines[:start] + lines[end:]
+                    removed = end - start
+                    print(f"  [worker {i}] {filepath}: remove {removed} line(s) [{start}:{end}]")
                     (wt / filepath).write_text("".join(remaining))
+                    git(["add", "--", filepath], cwd=wt)
                     interesting = run_test(cmd, wt, stop_event)
                     if interesting:
                         with results_lock:
-                            if not stop_event.is_set():
-                                stop_event.set()
-                                results.append((wt, s, remaining))
-                                return
+                            results.append((filepath, start, end, removed))
+                        stop_event.set()
+                    elif not stop_event.is_set():
+                        # Genuine failure (not an early cancellation by another worker).
+                        with failed_pairs_lock:
+                            failed_pairs.add((filepath, start, end))
                     restore_worktree(wt)
 
             threads = [threading.Thread(target=worker, args=(worktrees[i], i)) for i in range(n)]
@@ -344,15 +497,79 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
             for t in threads:
                 t.join()
 
+            print(results)
+
             if results:
-                winning_wt, winning_state, remaining = results[0]
-                removed = len(lines) - len(remaining)
-                msg = f"reduce: {filepath}: remove {removed} line(s) at [{winning_state.index}:{winning_state.end()}]"
-                print(f"[+] {msg}")
-                commit_hash = commit_change(winning_wt, msg)
+                results.sort(key=lambda r: r[3], reverse=True)
+                apply_wt = worktrees[0]
+                committed = False
+                changed_files: set[str] = set()
+
+                if len(results) > 1:
+                    # Group deletions by file and apply all at once per file.
+                    file_deletions: dict[str, list] = {}
+                    for fp, s, e, _ in results:
+                        file_deletions.setdefault(fp, []).append((s, e))
+
+                    dummy = threading.Event()
+                    for fp, dels in file_deletions.items():
+                        lines = file_lines[fp]
+                        sorted_dels = sorted(dels, key=lambda x: x[0])
+                        new_lines: list[str] = []
+                        prev = 0
+                        for s, e in sorted_dels:
+                            # Only append text if there is a gap between the previous
+                            # deletion and this one.
+                            if s > prev:
+                                new_lines.extend(lines[prev:s])
+                            
+                            # CRITICAL FIX: Ensure 'prev' never moves backwards.
+                            # If we have nested deletions (e.g. [10:30] and [15:25]),
+                            # prev is 30. We must not set it back to 25.
+                            prev = max(prev, e)
+                        new_lines.extend(lines[prev:])
+                        (apply_wt / fp).write_text("".join(new_lines))
+                        git(["add", "--", fp], cwd=apply_wt)
+
+                    if run_test(cmd, apply_wt, dummy):
+                        total = sum(r[3] for r in results)
+                        parts = "; ".join(f"{fp} [{s}:{e}]" for fp, s, e, _ in results)
+                        msg = f"reduce: {total} line(s) across {len(results)} regions: {parts}"
+                        print(f"[+] {msg}")
+                        commit_hash = commit_change(apply_wt, msg)
+                        changed_files = {fp for fp, s, e, _ in results}
+                        committed = True
+                    else:
+                        restore_worktree(apply_wt)
+
+                if not committed:
+                    fp, s, e, removed = results[0]
+                    lines = file_lines[fp]
+                    (apply_wt / fp).write_text("".join(lines[:s] + lines[e:]))
+                    git(["add", "--", fp], cwd=apply_wt)
+                    msg = f"reduce: {fp}: remove {removed} line(s) [{s}:{e}]"
+                    print(f"[+] {msg}")
+                    commit_hash = commit_change(apply_wt, msg)
+                    changed_files = {fp}
+
                 sync_worktrees_to_commit(commit_hash, [repo] + worktrees)
-            else:
-                break
+
+                # Clear failed_pairs for files whose content changed — their new
+                # content needs a fresh look at all granularities.
+                failed_pairs -= {k for k in failed_pairs if k[0] in changed_files}
+
+                successes_since_restart += 1
+                if successes_since_restart >= restart_after:
+                    # Periodic full reset: allow coarse chunks to be tried again
+                    # in case earlier reductions opened up new opportunities.
+                    successes_since_restart = 0
+                    failed_pairs.clear()
+
+                found = True
+                break  # restart outer while loop
+
+        if not found:
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +606,7 @@ def sanity_check(repo: Path, cmd: str) -> None:
         )
 
     print("[*] Sanity check passed.")
+    subprocess.run(["git", "clean", "-fd", "."], cwd=repo, capture_output=True)
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +631,25 @@ def main() -> None:
         required=True,
         metavar="COMMAND",
         help="interestingness test command (exit 0 = interesting)",
+    )
+    parser.add_argument(
+        "--lines-only",
+        action="store_true",
+        help="skip Phase 1 (file deletion) and go straight to line reduction",
+    )
+    parser.add_argument(
+        "--restart-after",
+        type=int,
+        default=8,
+        metavar="N",
+        help="restart to coarsest chunks after N successful reductions (default: 8)",
+    )
+    parser.add_argument(
+        "--jitter",
+        type=float,
+        default=0.05,
+        metavar="F",
+        help="randomize each chunk end by ±F fraction of chunk size (default: 0.05)",
     )
     parser.add_argument(
         "repo",
@@ -451,13 +688,16 @@ def main() -> None:
 
         try:
             # Phase 1: file deletion
-            print("\n[*] Phase 1: reducing files...")
-            files = reduce_files(files, repo, worktrees, cmd)
-            print(f"[*] Phase 1 done. Files remaining: {len(files)}")
+            if args.lines_only:
+                print("\n[*] Phase 1 skipped (--lines-only).")
+            else:
+                print("\n[*] Phase 1: reducing files...")
+                files = reduce_files(files, repo, worktrees, cmd, restart_after=args.restart_after)
+                print(f"[*] Phase 1 done. Files remaining: {len(files)}")
 
             # Phase 2: line deletion
             print("\n[*] Phase 2: reducing lines...")
-            reduce_lines(files, repo, worktrees, cmd)
+            reduce_lines(files, repo, worktrees, cmd, restart_after=args.restart_after, jitter=args.jitter)
             print("[*] Phase 2 done.")
 
         finally:
