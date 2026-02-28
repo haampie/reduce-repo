@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import queue
 import threading
 from dataclasses import dataclass
 from itertools import groupby
@@ -345,8 +346,14 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
 
     Uses depth-major ordering: all files are processed at depth 0 (whole-file
     removal), then depth 1 (half-file), etc. Within each depth files are sorted
-    largest-first. Multiple concurrent successes are recorded; we try combining
-    them and fall back to the best individual.
+    largest-first.
+
+    Within each depth level, n-1 producer threads test candidate deletions
+    independently and push passing patches to a shared queue. One applier thread
+    continuously drains the queue, combines all pending patches, and commits if
+    the combined test passes. On failure it discards the oldest half of its
+    accumulated patches and retries. Producers sync to the latest commit before
+    each task so stale patches are self-correcting.
 
     Already-failed (filepath, start, end) triples are remembered in failed_pairs
     and skipped in subsequent passes. On success, failed_pairs entries for the
@@ -356,9 +363,15 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
     """
     n = len(worktrees)
     ref_wt = worktrees[0]
+    apply_wt = worktrees[-1]       # dedicated applier worktree
+    producer_wts = worktrees[:-1]  # n−1 producer worktrees
+    n_producers = len(producer_wts)
+    assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
     failed_pairs: set[tuple[str, int, int]] = set()
     failed_pairs_lock = threading.Lock()
     successes_since_restart = 0
+    latest_commit: list[str] = [git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()]
+    latest_commit_lock = threading.Lock()
 
     while True:
         # Build per-file line lists (skip empty / binary / missing)
@@ -385,7 +398,6 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                 blank_deletions[filepath] = idxs
 
         if blank_deletions:
-            apply_wt = worktrees[0]
             for fp, idxs in blank_deletions.items():
                 idx_set = set(idxs)
                 new_lines = [ln for i, ln in enumerate(file_lines[fp]) if i not in idx_set]
@@ -399,6 +411,8 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                 print(f"[+] {msg}")
                 commit_hash = commit_change(apply_wt, msg)
                 sync_worktrees_to_commit(commit_hash, [repo] + worktrees)
+                with latest_commit_lock:
+                    latest_commit[0] = commit_hash
                 changed = set(blank_deletions)
                 failed_pairs -= {k for k in failed_pairs if k[0] in changed}
                 successes_since_restart += 1
@@ -461,17 +475,29 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
             task_iter = iter(task_list)
             task_iter_lock = threading.Lock()
 
-            def _next():
+            def _next_task():
                 with task_iter_lock:
                     return next(task_iter, None)
 
-            stop_event = threading.Event()
-            results: list = []
-            results_lock = threading.Lock()
+            patch_queue: queue.Queue = queue.Queue()
+            producers_done = threading.Event()
+            depth_applier_commits: list[str] = []
+            depth_changed_files: set[str] = set()
 
-            def worker(wt, i):
-                while not stop_event.is_set():
-                    task = _next()
+            def producer_worker(wt, i):
+                no_cancel = threading.Event()  # producers never cancel each other
+                my_commit: str | None = None
+                while True:
+                    # Sync worktree to latest commit before each task
+                    with latest_commit_lock:
+                        lc = latest_commit[0]
+                    if lc != my_commit:
+                        if my_commit is not None:
+                            subprocess.run(["git", "reset", "--hard", lc], cwd=wt, capture_output=True)
+                            subprocess.run(["git", "clean", "-fd", "."], cwd=wt, capture_output=True)
+                        my_commit = lc
+
+                    task = _next_task()
                     if task is None:
                         return
                     filepath, start, end, lines = task
@@ -479,94 +505,93 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                     removed = end - start
                     print(f"  [worker {i}] {filepath}: remove {removed} line(s) [{start}:{end}]")
                     (wt / filepath).write_text("".join(remaining))
-                    git(["add", "--", filepath], cwd=wt)
-                    interesting = run_test(cmd, wt, stop_event)
-                    if interesting:
-                        with results_lock:
-                            results.append((filepath, start, end, removed))
-                        stop_event.set()
-                    elif not stop_event.is_set():
-                        # Genuine failure (not an early cancellation by another worker).
+                    if run_test(cmd, wt, no_cancel):
+                        patch_queue.put((filepath, start, end, removed, lines))
+                    else:
                         with failed_pairs_lock:
                             failed_pairs.add((filepath, start, end))
                     restore_worktree(wt)
 
-            threads = [threading.Thread(target=worker, args=(worktrees[i], i)) for i in range(n)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+            def applier_worker():
+                pending: list = []  # (filepath, start, end, removed, lines)
+                dummy = threading.Event()
+                while True:
+                    # Drain all available patches
+                    try:
+                        while True:
+                            pending.append(patch_queue.get_nowait())
+                    except queue.Empty:
+                        pass
 
-            print(results)
+                    if not pending:
+                        if producers_done.is_set() and patch_queue.empty():
+                            break
+                        time.sleep(0.05)
+                        continue
 
-            if results:
-                results.sort(key=lambda r: r[3], reverse=True)
-                apply_wt = worktrees[0]
-                committed = False
-                changed_files: set[str] = set()
+                    # Combine patches: group by file, apply all deletions per file
+                    # using the lines snapshot embedded in each patch.
+                    file_dels: dict[str, tuple[list[str], list[tuple[int, int]]]] = {}
+                    for fp, s, e, _, lines in pending:
+                        if fp not in file_dels:
+                            file_dels[fp] = (lines, [])
+                        file_dels[fp][1].append((s, e))
 
-                if len(results) > 1:
-                    # Group deletions by file and apply all at once per file.
-                    file_deletions: dict[str, list] = {}
-                    for fp, s, e, _ in results:
-                        file_deletions.setdefault(fp, []).append((s, e))
-
-                    dummy = threading.Event()
-                    for fp, dels in file_deletions.items():
-                        lines = file_lines[fp]
+                    for fp, (lines, dels) in file_dels.items():
                         sorted_dels = sorted(dels, key=lambda x: x[0])
                         new_lines: list[str] = []
                         prev = 0
                         for s, e in sorted_dels:
-                            # Only append text if there is a gap between the previous
-                            # deletion and this one.
                             if s > prev:
                                 new_lines.extend(lines[prev:s])
-                            
-                            # CRITICAL FIX: Ensure 'prev' never moves backwards.
-                            # If we have nested deletions (e.g. [10:30] and [15:25]),
-                            # prev is 30. We must not set it back to 25.
                             prev = max(prev, e)
                         new_lines.extend(lines[prev:])
                         (apply_wt / fp).write_text("".join(new_lines))
                         git(["add", "--", fp], cwd=apply_wt)
 
                     if run_test(cmd, apply_wt, dummy):
-                        total = sum(r[3] for r in results)
-                        parts = "; ".join(f"{fp} [{s}:{e}]" for fp, s, e, _ in results)
-                        msg = f"reduce: {total} line(s) across {len(results)} regions: {parts}"
+                        total = sum(r[3] for r in pending)
+                        parts = "; ".join(f"{fp} [{s}:{e}]" for fp, s, e, _, _ in pending)
+                        msg = f"reduce: {total} line(s) across {len(pending)} regions: {parts}"
                         print(f"[+] {msg}")
                         commit_hash = commit_change(apply_wt, msg)
-                        changed_files = {fp for fp, s, e, _ in results}
-                        committed = True
+                        depth_applier_commits.append(commit_hash)
+                        depth_changed_files.update(fp for fp, *_ in pending)
+                        with latest_commit_lock:
+                            latest_commit[0] = commit_hash
+                        subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
+                        pending = []
                     else:
                         restore_worktree(apply_wt)
+                        n_discard = max(1, len(pending) // 2)
+                        pending = pending[n_discard:]
 
-                if not committed:
-                    fp, s, e, removed = results[0]
-                    lines = file_lines[fp]
-                    (apply_wt / fp).write_text("".join(lines[:s] + lines[e:]))
-                    git(["add", "--", fp], cwd=apply_wt)
-                    msg = f"reduce: {fp}: remove {removed} line(s) [{s}:{e}]"
-                    print(f"[+] {msg}")
-                    commit_hash = commit_change(apply_wt, msg)
-                    changed_files = {fp}
+            producer_threads = [
+                threading.Thread(target=producer_worker, args=(producer_wts[i], i))
+                for i in range(n_producers)
+            ]
+            applier_thread = threading.Thread(target=applier_worker)
 
-                sync_worktrees_to_commit(commit_hash, [repo] + worktrees)
+            for t in producer_threads:
+                t.start()
+            applier_thread.start()
+            for t in producer_threads:
+                t.join()
+            producers_done.set()
+            applier_thread.join()
 
-                # Clear failed_pairs for files whose content changed — their new
-                # content needs a fresh look at all granularities.
-                failed_pairs -= {k for k in failed_pairs if k[0] in changed_files}
-
-                successes_since_restart += 1
+            if depth_applier_commits:
+                last_commit = depth_applier_commits[-1]
+                sync_worktrees_to_commit(last_commit, [repo] + worktrees)
+                with latest_commit_lock:
+                    latest_commit[0] = last_commit
+                failed_pairs -= {k for k in failed_pairs if k[0] in depth_changed_files}
+                successes_since_restart += len(depth_applier_commits)
                 if successes_since_restart >= restart_after:
-                    # Periodic full reset: allow coarse chunks to be tried again
-                    # in case earlier reductions opened up new opportunities.
                     successes_since_restart = 0
                     failed_pairs.clear()
-
                 found = True
-                break  # restart outer while loop
+                break
 
         if not found:
             break
