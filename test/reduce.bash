@@ -3,7 +3,7 @@
 # verify that the 3 irrelevant files are deleted by phase 1.
 set -euo pipefail
 
-SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/reduce-repo.py"
+SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/reduce_repo.py"
 
 # Setup
 REPO=$(mktemp -d)

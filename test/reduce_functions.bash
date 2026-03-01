@@ -3,7 +3,7 @@
 # functions, verify that phase 1.5 removes them and records it in commit messages.
 set -euo pipefail
 
-SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/reduce-repo.py"
+SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/reduce_repo.py"
 
 REPO=$(mktemp -d)
 trap 'rm -rf "$REPO"' EXIT

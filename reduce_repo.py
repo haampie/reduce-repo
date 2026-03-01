@@ -238,6 +238,31 @@ def resolve_command(cmd: str, repo: Path, tempdir: Path) -> str:
     return str(candidate) + cmd[len(first) :]
 
 
+def _apply_deletions(lines: list[str], intervals: list[tuple[int, int]]) -> list[str]:
+    """Return lines with given (start, end) intervals removed.
+
+    Intervals are 0-based, end-exclusive. Out-of-bounds ends are clipped.
+    Overlapping and adjacent intervals are merged. Input need not be sorted.
+    """
+    sorted_ivs = sorted(intervals)
+    merged: list[tuple[int, int]] = []
+    for s, e in sorted_ivs:
+        e = min(e, len(lines))
+        if s >= e:
+            continue
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    result: list[str] = []
+    prev = 0
+    for s, e in merged:
+        result.extend(lines[prev:s])
+        prev = e
+    result.extend(lines[prev:])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: reduce files
 # ---------------------------------------------------------------------------
@@ -393,24 +418,9 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
             if not full_path.exists():
                 continue
             lines = full_path.read_text(errors="ignore").splitlines(keepends=True)
-            intervals.sort()
-            merged: list[tuple[int, int]] = []
-            for s, e in intervals:
-                e = min(e, len(lines))
-                if s >= e:
-                    continue
-                if merged and s <= merged[-1][1]:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-                else:
-                    merged.append((s, e))
-            if not merged:
+            new_lines = _apply_deletions(lines, intervals)
+            if new_lines == lines:
                 continue
-            new_lines: list[str] = []
-            prev = 0
-            for s, e in merged:
-                new_lines.extend(lines[prev:s])
-                prev = e
-            new_lines.extend(lines[prev:])
             full_path.write_text("".join(new_lines))
             git(["add", "--", fp], cwd=wt)
             changed = True
@@ -635,48 +645,67 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
         # Sort files largest-first so the most impactful deletions appear first.
         sorted_files = sorted(file_lines, key=lambda fp: len(file_lines[fp]), reverse=True)
 
-        # Build per-file depth groups: list of [states] per depth level.
-        file_depth_groups: dict[str, list[list]] = {}
-        for filepath in sorted_files:
-            lines = file_lines[filepath]
-            s0 = BinaryState.create(len(lines))
-            groups = [
-                list(grp)
-                for _, grp in groupby(
-                    _state_iter(s0), key=lambda s: s.chunk
+        # Use the largest file as the reference for chunk sizes so every depth round
+        # has a single chunk granularity.  Files smaller than the current chunk are
+        # skipped to avoid pointless whole-file attempts on tiny files.
+        max_lines = len(file_lines[sorted_files[0]])
+        ref_chunk_sizes = [
+            grp[0].chunk
+            for grp in (
+                list(g)
+                for _, g in groupby(
+                    _state_iter(BinaryState.create(max_lines)), key=lambda s: s.chunk
                 )
-            ]
+            )
+        ]
+
+        file_depth_groups: dict[str, list[list[BinaryState]]] = {}
+        for filepath in sorted_files:
+            n = len(file_lines[filepath])
+            groups: list[list[BinaryState]] = []
+            for chunk_size in ref_chunk_sizes:
+                if chunk_size > n:
+                    groups.append([])
+                    continue
+                last_start = ((n - 1) // chunk_size) * chunk_size
+                states: list[BinaryState] = []
+                for k_start in range(last_start, -1, -chunk_size):
+                    s = BinaryState(instances=n, chunk=chunk_size, index=k_start)
+                    if (s.end() - k_start) * 2 >= chunk_size:   # same filter as _state_iter
+                        states.append(s)
+                groups.append(states)
             file_depth_groups[filepath] = groups
 
         found = False
-        for depth in range(64):
+        for depth in range(len(ref_chunk_sizes)):
             # Build task list for this depth across all files (largest-first),
             # skipping (filepath, start, end) triples that already failed.
             task_list = []
             has_any_at_depth = False
             for filepath in sorted_files:
-                groups = file_depth_groups[filepath]
-                if depth < len(groups):
-                    has_any_at_depth = True
-                    lines = file_lines[filepath]
-                    for s in groups[depth]:
-                        raw_end = s.end()
-                        chunk_size = raw_end - s.index
-                        if jitter > 0 and chunk_size > 1:
-                            delta = round(chunk_size * random.uniform(-jitter, jitter))
-                            end = max(s.index + 1, min(len(lines), raw_end + delta))
-                        else:
-                            end = raw_end
-                        # heuristic, class Foo is typically in the first 10 lines.
-                        # Exception: 0:N (whole file) is always tried.
-                        if s.index == 0 and end > 10 and s.chunk != len(lines):
-                            continue
-                        key = (filepath, s.index, end)
-                        if key not in failed_pairs:
-                            task_list.append((filepath, s.index, end, lines))
+                if not file_depth_groups[filepath][depth]:
+                    continue
+                has_any_at_depth = True
+                lines = file_lines[filepath]
+                n = len(lines)
+                for s in file_depth_groups[filepath][depth]:
+                    raw_end = s.end()
+                    chunk_size = raw_end - s.index
+                    if jitter > 0 and chunk_size > 1:
+                        delta = round(chunk_size * random.uniform(-jitter, jitter))
+                        end = max(s.index + 1, min(len(lines), raw_end + delta))
+                    else:
+                        end = raw_end
+                    # heuristic, class Foo is typically in the first 10 lines.
+                    # Exception: 0:N (whole file) is always tried.
+                    if s.index == 0 and end > 10 and end < n:
+                        continue
+                    key = (filepath, s.index, end)
+                    if key not in failed_pairs:
+                        task_list.append((filepath, s.index, end, lines))
 
             if not has_any_at_depth:
-                break  # all depths exhausted — nothing more to try
+                continue  # no file has content at this chunk granularity; try next depth
 
             if not task_list:
                 continue  # every task at this depth already failed; try next depth
@@ -753,14 +782,7 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                         file_dels[fp][1].append((s, e))
 
                     for fp, (lines, dels) in file_dels.items():
-                        sorted_dels = sorted(dels, key=lambda x: x[0])
-                        new_lines: list[str] = []
-                        prev = 0
-                        for s, e in sorted_dels:
-                            if s > prev:
-                                new_lines.extend(lines[prev:s])
-                            prev = max(prev, e)
-                        new_lines.extend(lines[prev:])
+                        new_lines = _apply_deletions(lines, dels)
                         (apply_wt / fp).write_text("".join(new_lines))
                         git(["add", "--", fp], cwd=apply_wt)
 
