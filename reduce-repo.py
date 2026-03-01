@@ -255,12 +255,18 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
         if state is None:
             break
 
-        _it = _state_iter(state)
+        _all_states = list(_state_iter(state))
+        _n_states = len(_all_states)
+        _it = iter(_all_states)
+        _dispatched = [0]
         _it_lock = threading.Lock()
 
         def _next():
             with _it_lock:
-                return next(_it, None)
+                s = next(_it, None)
+                if s is not None:
+                    _dispatched[0] += 1
+                return s
 
         latest_commit: list[str] = [git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()]
         latest_commit_lock = threading.Lock()
@@ -291,7 +297,8 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
                 if not to_delete:
                     continue
                 names = ", ".join(to_delete[:3]) + ("..." if len(to_delete) > 3 else "")
-                print(f"  [worker {i}] delete {len(to_delete)} file(s): {names}")
+                pct = _dispatched[0] * 100 // _n_states
+                print(f"  [worker {i}] ({pct:3d}%) delete {len(to_delete)} file(s): {names}")
                 for f in to_delete:
                     (wt / f).unlink(missing_ok=True)
                 git(["rm", "--cached", "--ignore-unmatch", "--"] + to_delete, cwd=wt)
@@ -375,10 +382,12 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
     assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
     ref_wt = worktrees[0]
 
-    def _delete_func_ranges(wt: Path, batch: list[tuple[str, int, int]]) -> None:
+    def _delete_func_ranges(wt: Path, batch: list[tuple[str, int, int]]) -> bool:
+        """Apply deletions; return True if any file was actually changed."""
         by_file: dict[str, list[tuple[int, int]]] = {}
         for fp, s, e in batch:
             by_file.setdefault(fp, []).append((s, e))
+        changed = False
         for fp, intervals in by_file.items():
             full_path = wt / fp
             if not full_path.exists():
@@ -394,6 +403,8 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
                     merged[-1] = (merged[-1][0], max(merged[-1][1], e))
                 else:
                     merged.append((s, e))
+            if not merged:
+                continue
             new_lines: list[str] = []
             prev = 0
             for s, e in merged:
@@ -402,6 +413,8 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
             new_lines.extend(lines[prev:])
             full_path.write_text("".join(new_lines))
             git(["add", "--", fp], cwd=wt)
+            changed = True
+        return changed
 
     while True:
         funcs: list[tuple[str, int, int]] = []
@@ -430,12 +443,18 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
         funcs.sort()
 
         state = BinaryState.create(len(funcs))
-        _it = _state_iter(state)
+        _all_states = list(_state_iter(state))
+        _n_states = len(_all_states)
+        _it = iter(_all_states)
+        _dispatched = [0]
         _it_lock = threading.Lock()
 
         def _next():
             with _it_lock:
-                return next(_it, None)
+                s = next(_it, None)
+                if s is not None:
+                    _dispatched[0] += 1
+                return s
 
         initial_commit = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
         latest_commit: list[str] = [initial_commit]
@@ -461,9 +480,9 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
                 batch = [(fp, s0, e) for fp, s0, e in funcs[s.index:s.end()] if (wt / fp).exists()]
                 if not batch:
                     continue
-                print(f"  [worker {i}] try {len(batch)} function(s)")
-                _delete_func_ranges(wt, batch)
-                if run_test(cmd, wt, no_cancel):
+                pct = _dispatched[0] * 100 // _n_states
+                print(f"  [worker {i}] ({pct:3d}%) try {len(batch)} function(s)")
+                if _delete_func_ranges(wt, batch) and run_test(cmd, wt, no_cancel):
                     patch_queue.put(batch)
                 restore_worktree(wt)
 
@@ -489,9 +508,12 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
                     pending = []
                     continue
 
-                _delete_func_ranges(apply_wt, all_triples)
                 files_affected = sorted({fp for fp, _, _ in all_triples})
                 names = ", ".join(files_affected[:3]) + ("..." if len(files_affected) > 3 else "")
+
+                if not _delete_func_ranges(apply_wt, all_triples):
+                    pending = []
+                    continue
 
                 if run_test(cmd, apply_wt, dummy):
                     msg = f"reduce: delete {len(all_triples)} function(s) in {names}"
@@ -659,12 +681,17 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
             if not task_list:
                 continue  # every task at this depth already failed; try next depth
 
+            _n_tasks = len(task_list)
+            _dispatched = [0]
             task_iter = iter(task_list)
             task_iter_lock = threading.Lock()
 
             def _next_task():
                 with task_iter_lock:
-                    return next(task_iter, None)
+                    t = next(task_iter, None)
+                    if t is not None:
+                        _dispatched[0] += 1
+                    return t
 
             patch_queue: queue.Queue = queue.Queue()
             producers_done = threading.Event()
@@ -690,7 +717,8 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                     filepath, start, end, lines = task
                     remaining = lines[:start] + lines[end:]
                     removed = end - start
-                    print(f"  [worker {i}] {filepath}: remove {removed} line(s) [{start}:{end}]")
+                    pct = _dispatched[0] * 100 // _n_tasks
+                    print(f"  [worker {i}] ({pct:3d}%) {filepath}: remove {removed} line(s) [{start}:{end}]")
                     (wt / filepath).write_text("".join(remaining))
                     if run_test(cmd, wt, no_cancel):
                         patch_queue.put((filepath, start, end, removed, lines))
