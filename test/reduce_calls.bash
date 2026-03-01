@@ -15,7 +15,8 @@ git config user.name "test"
 
 cat > lib.py <<'EOF'
 # BUG
-noise()
+class Noise:
+    noise()
 EOF
 
 git add .

@@ -149,7 +149,7 @@ def sync_worktrees_to_commit(commit: str, worktrees: list[Path]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_test(cmd: str, wt: Path, stop_event: threading.Event) -> bool:
+def run_test(cmd: str, wt: Path, stop_event: threading.Event, verbose: bool = False) -> bool:
     """Run the interestingness test in wt. Return True if interesting (exit 0).
 
     Polls stop_event every 50ms and terminates the subprocess early if set.
@@ -176,7 +176,7 @@ def run_test(cmd: str, wt: Path, stop_event: threading.Event) -> bool:
                         proc.kill()
                     return False
 
-        if proc.returncode == 0:
+        if proc.returncode == 0 or verbose:
             # Rewind files to read captured output
             stdout_f.seek(0)
             stderr_f.seek(0)
@@ -190,11 +190,10 @@ def run_test(cmd: str, wt: Path, stop_event: threading.Event) -> bool:
             if err:
                 msg.append(f"STDERR:\n{err}")
             msg.append("------------------------------------------\n")
-            
+
             # Print strictly one message at a time to avoid garbled text
             print("\n".join(msg), flush=True)
-            return True
-        return False
+        return proc.returncode == 0
 
 
 
@@ -382,7 +381,7 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
                     min_successful_chunk = min(min_successful_chunk, batch_min)
                     pending = []
                     n_applied += 1
-                    if n_applied >= 8:
+                    if n_applied >= 4:
                         restart_chunk_size[0] = min_successful_chunk * 2
                         restart_event.set()
                 else:
@@ -415,183 +414,51 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
 
 
 # ---------------------------------------------------------------------------
-# Phase 0: reduce calls
+# Phase 1.5: reduce functions and calls
 # ---------------------------------------------------------------------------
 
 
-def reduce_calls(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> None:
-    """Delete outermost call statement lines until no further reduction is possible."""
-    apply_wt = worktrees[-1]
-    producer_wts = worktrees[:-1]
-    n_producers = len(producer_wts)
-    assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
-    ref_wt = worktrees[0]
+def _collect_funcs_and_calls(
+    tree: ast.AST, filepath: str, lines_list: list[str]
+) -> tuple[list[tuple[str, int, int]], list[tuple[str, int, int]]]:
+    """Return (function_defs, function_calls).
 
-    def _delete_call_ranges(wt: Path, batch: list[tuple[str, int, int]]) -> bool:
-        """Apply deletions; return True if any file was actually changed."""
-        by_file: dict[str, list[tuple[int, int]]] = {}
-        for fp, s, e in batch:
-            by_file.setdefault(fp, []).append((s, e))
-        changed = False
-        for fp, intervals in by_file.items():
-            full_path = wt / fp
-            if not full_path.exists():
-                continue
-            lines = full_path.read_text(errors="ignore").splitlines(keepends=True)
-            new_lines = _apply_deletions(lines, intervals)
-            if new_lines == lines:
-                continue
-            full_path.write_text("".join(new_lines))
-            git(["add", "--", fp], cwd=wt)
-            changed = True
-        return changed
+    Traverses the AST with a stack. Does NOT recurse into FunctionDef/
+    AsyncFunctionDef bodies or into ast.Expr(Call) subtrees, so only
+    top-level (outer) definitions and calls are collected.
 
-    while True:
-        calls: list[tuple[str, int, int]] = []
-        for filepath in files:
-            if not filepath.endswith(".py"):
-                continue
-            full_path = ref_wt / filepath
-            if not full_path.exists():
-                continue
-            content = full_path.read_text(errors="ignore")
-            try:
-                tree = ast.parse(content)
-            except SyntaxError:
-                continue
-            stack = list(ast.iter_child_nodes(tree))
-            while stack:
-                node = stack.pop()
-                if isinstance(node, ast.Call):
-                    calls.append((filepath, node.lineno - 1, node.end_lineno))
-                    # Do not recurse into call arguments - outermost calls only
-                else:
-                    stack.extend(ast.iter_child_nodes(node))
-
-        if not calls:
-            break
-        random.shuffle(calls)
-
-        state = BinaryState.create(len(calls))
-        _all_states = list(_state_iter(state))
-        _n_states = len(_all_states)
-        _it = iter(_all_states)
-        _dispatched = [0]
-        _it_lock = threading.Lock()
-
-        def _next():
-            with _it_lock:
-                s = next(_it, None)
-                if s is not None:
-                    _dispatched[0] += 1
-                return s
-
-        initial_commit = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
-        latest_commit: list[str] = [initial_commit]
-        latest_commit_lock = threading.Lock()
-        patch_queue: queue.Queue = queue.Queue()
-        producers_done = threading.Event()
-
-        def producer_worker(wt, i):
-            my_commit: str | None = None
-            no_cancel = threading.Event()
-            while True:
-                with latest_commit_lock:
-                    lc = latest_commit[0]
-                if lc != my_commit:
-                    if my_commit is not None:
-                        subprocess.run(["git", "reset", "--hard", lc], cwd=wt, capture_output=True)
-                    my_commit = lc
-                subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
-
-                s = _next()
-                if s is None:
-                    return
-                batch = [(fp, s0, e) for fp, s0, e in calls[s.index:s.end()] if (wt / fp).exists()]
-                if not batch:
-                    continue
-                pct = _dispatched[0] * 100 // _n_states
-                print(f"  [worker {i}] ({pct:3d}%) try {len(batch)} call(s)")
-                if _delete_call_ranges(wt, batch) and run_test(cmd, wt, no_cancel):
-                    patch_queue.put(batch)
-                restore_worktree(wt)
-
-        def applier_worker():
-            pending: list[list[tuple[str, int, int]]] = []
-            dummy = threading.Event()
-            while True:
-                try:
-                    while True:
-                        pending.append(patch_queue.get_nowait())
-                except queue.Empty:
-                    pass
-
-                if not pending:
-                    if producers_done.is_set() and patch_queue.empty():
-                        break
-                    time.sleep(0.05)
-                    continue
-
-                all_triples = [(fp, s, e) for batch in pending for fp, s, e in batch
-                               if (apply_wt / fp).exists()]
-                if not all_triples:
-                    pending = []
-                    continue
-
-                files_affected = sorted({fp for fp, _, _ in all_triples})
-                names = ", ".join(files_affected[:3]) + ("..." if len(files_affected) > 3 else "")
-
-                if not _delete_call_ranges(apply_wt, all_triples):
-                    pending = []
-                    continue
-
-                if run_test(cmd, apply_wt, dummy):
-                    msg = f"reduce: delete {len(all_triples)} call(s) in {names}"
-                    print(f"[+] {msg}")
-                    commit_hash = commit_change(apply_wt, msg)
-                    subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
-                    with latest_commit_lock:
-                        latest_commit[0] = commit_hash
-                    pending = []
-                else:
-                    restore_worktree(apply_wt)
-                    n_discard = max(1, len(pending) // 2)
-                    pending = pending[n_discard:]
-
-        producer_threads = [
-            threading.Thread(target=producer_worker, args=(producer_wts[i], i))
-            for i in range(n_producers)
-        ]
-        applier_thread = threading.Thread(target=applier_worker)
-        for t in producer_threads:
-            t.start()
-        applier_thread.start()
-        for t in producer_threads:
-            t.join()
-        producers_done.set()
-        applier_thread.join()
-
-        committed = latest_commit[0] != initial_commit
-        if committed:
-            sync_worktrees_to_commit(latest_commit[0], [repo] + worktrees)
+    function_defs: (filepath, start0, end1) including decorators and trailing blank lines.
+    function_calls: (filepath, start0, end1) for bare call statements.
+    """
+    function_defs: list[tuple[str, int, int]] = []
+    function_calls: list[tuple[str, int, int]] = []
+    stack = list(ast.iter_child_nodes(tree))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            first_line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            end = node.end_lineno
+            while end < len(lines_list) and not lines_list[end].strip():
+                end += 1
+            function_defs.append((filepath, first_line - 1, end))
+            # Do not recurse into function body
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            function_calls.append((filepath, node.lineno - 1, node.end_lineno))
+            # Do not recurse into the call expression
         else:
-            break
-
-
-# ---------------------------------------------------------------------------
-# Phase 1.5: reduce functions
-# ---------------------------------------------------------------------------
+            stack.extend(ast.iter_child_nodes(node))
+    return function_defs, function_calls
 
 
 def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> None:
-    """Delete entire function bodies until no further reduction is possible."""
+    """Delete function definitions and bare call statements until no further reduction is possible."""
     apply_wt = worktrees[-1]
     producer_wts = worktrees[:-1]
     n_producers = len(producer_wts)
     assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
     ref_wt = worktrees[0]
 
-    def _delete_func_ranges(wt: Path, batch: list[tuple[str, int, int]]) -> bool:
+    def _delete_ranges(wt: Path, batch: list[tuple[str, int, int]]) -> bool:
         """Apply deletions; return True if any file was actually changed."""
         by_file: dict[str, list[tuple[int, int]]] = {}
         for fp, s, e in batch:
@@ -611,7 +478,8 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
         return changed
 
     while True:
-        funcs: list[tuple[str, int, int]] = []
+        all_defs: list[tuple[str, int, int]] = []
+        all_calls: list[tuple[str, int, int]] = []
         for filepath in files:
             if not filepath.endswith(".py"):
                 continue
@@ -624,24 +492,19 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
             except SyntaxError:
                 continue
             lines_list = content.splitlines()
-            stack = list(ast.iter_child_nodes(tree))
-            while stack:
-                node = stack.pop()
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    first_line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
-                    end = node.end_lineno  # 0-indexed exclusive end
-                    while end < len(lines_list) and not lines_list[end].strip():
-                        end += 1
-                    funcs.append((filepath, first_line - 1, end))
-                    # Do not recurse into the function body - only outer functions
-                else:
-                    stack.extend(ast.iter_child_nodes(node))
+            defs, calls = _collect_funcs_and_calls(tree, filepath, lines_list)
+            all_defs.extend(defs)
+            all_calls.extend(calls)
 
-        if not funcs:
+        # Partition: defs first so slices of the tail (calls) are cheap to delete.
+        items = all_defs + all_calls
+        print(f"[*] Found {len(all_defs)} function(s) and {len(all_calls)} call(s)")
+
+        if not items:
             break
-        funcs.sort()
 
-        state = BinaryState.create(len(funcs))
+        defs_set = set(all_defs)
+        state = BinaryState.create(len(items))
         _all_states = list(_state_iter(state))
         _n_states = len(_all_states)
         _it = iter(_all_states)
@@ -676,12 +539,12 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
                 s = _next()
                 if s is None:
                     return
-                batch = [(fp, s0, e) for fp, s0, e in funcs[s.index:s.end()] if (wt / fp).exists()]
+                batch = [(fp, s0, e) for fp, s0, e in items[s.index:s.end()] if (wt / fp).exists()]
                 if not batch:
                     continue
                 pct = _dispatched[0] * 100 // _n_states
-                print(f"  [worker {i}] ({pct:3d}%) try {len(batch)} function(s)")
-                if _delete_func_ranges(wt, batch) and run_test(cmd, wt, no_cancel):
+                print(f"  [worker {i}] ({pct:3d}%) try {len(batch)} item(s)")
+                if _delete_ranges(wt, batch) and run_test(cmd, wt, no_cancel):
                     patch_queue.put(batch)
                 restore_worktree(wt)
 
@@ -710,12 +573,19 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
                 files_affected = sorted({fp for fp, _, _ in all_triples})
                 names = ", ".join(files_affected[:3]) + ("..." if len(files_affected) > 3 else "")
 
-                if not _delete_func_ranges(apply_wt, all_triples):
+                if not _delete_ranges(apply_wt, all_triples):
                     pending = []
                     continue
 
                 if run_test(cmd, apply_wt, dummy):
-                    msg = f"reduce: delete {len(all_triples)} function(s) in {names}"
+                    n_funcs = sum(1 for t in all_triples if t in defs_set)
+                    n_calls = len(all_triples) - n_funcs
+                    parts = []
+                    if n_funcs:
+                        parts.append(f"{n_funcs} function(s)")
+                    if n_calls:
+                        parts.append(f"{n_calls} call(s)")
+                    msg = f"reduce: delete {' and '.join(parts)} in {names}"
                     print(f"[+] {msg}")
                     commit_hash = commit_change(apply_wt, msg)
                     subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
@@ -1289,7 +1159,7 @@ def sanity_check(repo: Path, cmd: str) -> None:
     # 3. Test passes at HEAD?
     print("[*] Running sanity check (test must pass at HEAD)...")
     dummy_event = threading.Event()
-    if not run_test(cmd, repo, dummy_event):
+    if not run_test(cmd, repo, dummy_event, verbose=True):
         sys.exit(
             "error: interestingness test does not pass at HEAD (exit non-0); nothing to reduce"
         )
@@ -1348,6 +1218,7 @@ def main() -> None:
     # Create a parent temp dir for worktrees and resolved scripts
     parent = Path(tempfile.mkdtemp(prefix="reduce-repo-"))
     print(f"[*] Working directory: {parent}")
+    start = time.monotonic()
 
     try:
         # Resolve the command before sanity check so it works even if the
@@ -1374,10 +1245,6 @@ def main() -> None:
                 cycle += 1
                 head_before = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
 
-                print(f"\n[*] Phase 0 (cycle {cycle}): reducing calls...")
-                reduce_calls(files, repo, worktrees, cmd)
-                print("[*] Phase 0 done.")
-
                 if args.lines_only:
                     if cycle == 1:
                         print("\n[*] Phase 1 skipped (--lines-only).")
@@ -1386,7 +1253,7 @@ def main() -> None:
                     files = reduce_files(files, repo, worktrees, cmd)
                     print(f"[*] Phase 1 done. Files remaining: {len(files)}")
 
-                print(f"\n[*] Phase 1.5 (cycle {cycle}): reducing functions...")
+                print(f"\n[*] Phase 1.5 (cycle {cycle}): reducing functions and calls...")
                 reduce_functions(files, repo, worktrees, cmd)
                 print("[*] Phase 1.5 done.")
 
@@ -1414,6 +1281,7 @@ def main() -> None:
 
         print("\n[*] Reduction complete. Commits:")
         subprocess.run(["git", "log", "--oneline", "-20"], cwd=repo)
+        print(f"\n[*] Done in {time.monotonic() - start:.1f}s")
 
     finally:
         shutil.rmtree(parent, ignore_errors=True)
