@@ -256,10 +256,9 @@ def resolve_command(cmd: str, repo: Path, tempdir: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str, restart_after: int = 8) -> list[str]:
+def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> list[str]:
     """Delete whole files until no further reduction is possible. Returns reduced file list."""
     n = len(worktrees)
-    successes_since_restart = 0
     next_chunk: int | None = None
 
     while True:
@@ -284,6 +283,11 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
         stop_event = threading.Event()
         results: list = []
         results_lock = threading.Lock()
+
+        files.reverse()  # alternate each round
+        # and do a random rotation
+        rot = secrets.randbelow(len(files))
+        files = files[rot:] + files[:rot]
 
         def worker(wt, i):
             while not stop_event.is_set():
@@ -318,17 +322,11 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
             print(f"[+] {msg}")
             commit_hash = commit_change(winning_wt, msg)
             sync_worktrees_to_commit(commit_hash, [repo] + worktrees)
-            successes_since_restart += 1
-            if successes_since_restart >= restart_after:
-                successes_since_restart = 0
-                next_chunk = None
-            else:
-                next_chunk = max(1, len(deleted))
+            next_chunk = None
         else:
             if next_chunk is not None:
                 # Started mid-sequence; retry from top before declaring done.
                 # The file list changed, so larger chunks might now succeed.
-                successes_since_restart = 0
                 next_chunk = None
                 continue
             break
@@ -717,7 +715,7 @@ def main() -> None:
                 print("\n[*] Phase 1 skipped (--lines-only).")
             else:
                 print("\n[*] Phase 1: reducing files...")
-                files = reduce_files(files, repo, worktrees, cmd, restart_after=args.restart_after)
+                files = reduce_files(files, repo, worktrees, cmd)
                 print(f"[*] Phase 1 done. Files remaining: {len(files)}")
 
             # Phase 2: line deletion
