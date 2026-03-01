@@ -470,7 +470,7 @@ def reduce_calls(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
 
         if not calls:
             break
-        calls.sort()
+        random.shuffle(calls)
 
         state = BinaryState.create(len(calls))
         _all_states = list(_state_iter(state))
