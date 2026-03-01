@@ -125,7 +125,7 @@ def remove_worktrees(repo: Path, worktrees: list[Path]) -> None:
 
 def restore_worktree(wt: Path) -> None:
     """Bring worktree to exact match of HEAD — remove test artifacts, restore tracked files."""
-    subprocess.run(["git", "clean", "-fd", "."], cwd=wt, capture_output=True)
+    subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
     subprocess.run(["git", "checkout", "HEAD", "--", "."], cwd=wt, capture_output=True)
 
 
@@ -140,7 +140,7 @@ def sync_worktrees_to_commit(commit: str, worktrees: list[Path]) -> None:
     """Reset all worktrees to a specific commit."""
     for wt in worktrees:
         subprocess.run(["git", "reset", "--hard", commit], cwd=wt, capture_output=True)
-        subprocess.run(["git", "clean", "-fd", "."], cwd=wt, capture_output=True)
+        subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
 
 
 # ---------------------------------------------------------------------------
@@ -494,8 +494,8 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                     if lc != my_commit:
                         if my_commit is not None:
                             subprocess.run(["git", "reset", "--hard", lc], cwd=wt, capture_output=True)
-                            subprocess.run(["git", "clean", "-fd", "."], cwd=wt, capture_output=True)
                         my_commit = lc
+                    subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
 
                     task = _next_task()
                     if task is None:
