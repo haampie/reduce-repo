@@ -419,7 +419,8 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
             while stack:
                 node = stack.pop()
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    funcs.append((filepath, node.lineno - 1, node.end_lineno))
+                    first_line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+                    funcs.append((filepath, first_line - 1, node.end_lineno))
                     # Do not recurse into the function body — only outer functions
                 else:
                     stack.extend(ast.iter_child_nodes(node))

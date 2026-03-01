@@ -22,9 +22,16 @@ def noise1():
     y = "nothing useful"
     return y
 
+@staticmethod
 def noise2():
     z = "also useless"
     return z
+
+@some_decorator
+@another_decorator
+def noise3():
+    w = "triple noise"
+    return w
 EOF
 
 git add .
@@ -47,9 +54,9 @@ if ! git -C "$REPO" log --oneline | grep -q "delete.*function"; then
     exit 1
 fi
 
-# The noise functions must be gone from the file
-if grep -qE "noise1|noise2" "$REPO/lib.py"; then
-    echo "FAIL: noise functions still present in lib.py"
+# The noise functions must be gone — including their decorator lines
+if grep -qE "noise1|noise2|noise3|some_decorator|another_decorator" "$REPO/lib.py"; then
+    echo "FAIL: noise functions (or their decorators) still present in lib.py"
     cat "$REPO/lib.py"
     exit 1
 fi
