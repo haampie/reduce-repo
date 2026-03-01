@@ -92,7 +92,5 @@ the reduced repository is on the new branch.
 ## Tests
 
 ```bash
-python -m pytest test/test_applier.py -v
-bash test/reduce.bash
-bash test/reduce_functions.bash
+python -m pytest
 ```
