@@ -589,7 +589,6 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
     failed_pairs_lock = threading.Lock()
     latest_commit: list[str] = [git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()]
     latest_commit_lock = threading.Lock()
-    did_final_sweep = False
 
     while True:
         # Build per-file line lists (skip empty / binary / missing)
@@ -630,7 +629,6 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                     latest_commit[0] = commit_hash
                 changed = set(blank_deletions)
                 failed_pairs -= {k for k in failed_pairs if k[0] in changed}
-                did_final_sweep = False
                 continue  # restart outer loop; re-read file_lines
             else:
                 restore_worktree(apply_wt)
@@ -820,14 +818,7 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                 break
 
         if not found:
-            if not did_final_sweep and failed_pairs:
-                # One last sweep with all caches cleared before giving up;
-                # cross-file changes may have made previously-failed tasks feasible.
-                did_final_sweep = True
-                failed_pairs.clear()
-                continue
             break
-        did_final_sweep = False  # progress made; future termination will retry
 
 
 # ---------------------------------------------------------------------------
