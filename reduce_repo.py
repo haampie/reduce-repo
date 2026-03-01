@@ -561,7 +561,7 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
 # ---------------------------------------------------------------------------
 
 
-def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, jitter: float = 0.05) -> None:
+def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, jitter: float = 0.05, min_chunk_size: int = 1) -> None:
     """Delete lines within files until no further reduction is possible.
 
     Uses depth-major ordering: all files are processed at depth 0 (whole-file
@@ -658,9 +658,17 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                 if chunk_size > n:
                     groups.append([])
                     continue
-                last_start = ((n - 1) // chunk_size) * chunk_size
+                if chunk_size == 2:
+                    # Use stride 1 to cover all adjacent pairs (even- and odd-aligned).
+                    # Jitter has no effect at size 2 (round(2*0.05)=0), so without this
+                    # odd-aligned pairs like [1:3] are never tried as a unit.
+                    last_start = n - 2
+                    stride = 1
+                else:
+                    last_start = ((n - 1) // chunk_size) * chunk_size
+                    stride = chunk_size
                 states: list[BinaryState] = []
-                for k_start in range(last_start, -1, -chunk_size):
+                for k_start in range(last_start, -1, -stride):
                     s = BinaryState(instances=n, chunk=chunk_size, index=k_start)
                     if (s.end() - k_start) * 2 >= chunk_size:   # same filter as _state_iter
                         states.append(s)
@@ -669,6 +677,8 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
 
         found = False
         for depth in range(len(ref_chunk_sizes)):
+            if ref_chunk_sizes[depth] < min_chunk_size:
+                break
             # Build task list for this depth across all files (largest-first),
             # skipping (filepath, start, end) triples that already failed.
             task_list = []
@@ -947,11 +957,11 @@ def main() -> None:
                 print("[*] Phase 1.5 done.")
 
                 print(f"\n[*] Phase 2 (cycle {cycle}): reducing lines...")
-                reduce_lines(files, repo, worktrees, cmd, jitter=args.jitter)
+                reduce_lines(files, repo, worktrees, cmd, jitter=args.jitter, min_chunk_size=16 if cycle == 1 else 1)
                 print("[*] Phase 2 done.")
 
                 head_after = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
-                if head_after == head_before:
+                if head_after == head_before and cycle >= 2:
                     break  # fixed point: full cycle produced no new commits
                 print(f"\n[*] Cycle {cycle} made progress; restarting phase cycle...")
 
