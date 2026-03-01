@@ -415,6 +415,170 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
 
 
 # ---------------------------------------------------------------------------
+# Phase 0: reduce calls
+# ---------------------------------------------------------------------------
+
+
+def reduce_calls(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> None:
+    """Delete outermost call statement lines until no further reduction is possible."""
+    apply_wt = worktrees[-1]
+    producer_wts = worktrees[:-1]
+    n_producers = len(producer_wts)
+    assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
+    ref_wt = worktrees[0]
+
+    def _delete_call_ranges(wt: Path, batch: list[tuple[str, int, int]]) -> bool:
+        """Apply deletions; return True if any file was actually changed."""
+        by_file: dict[str, list[tuple[int, int]]] = {}
+        for fp, s, e in batch:
+            by_file.setdefault(fp, []).append((s, e))
+        changed = False
+        for fp, intervals in by_file.items():
+            full_path = wt / fp
+            if not full_path.exists():
+                continue
+            lines = full_path.read_text(errors="ignore").splitlines(keepends=True)
+            new_lines = _apply_deletions(lines, intervals)
+            if new_lines == lines:
+                continue
+            full_path.write_text("".join(new_lines))
+            git(["add", "--", fp], cwd=wt)
+            changed = True
+        return changed
+
+    while True:
+        calls: list[tuple[str, int, int]] = []
+        for filepath in files:
+            if not filepath.endswith(".py"):
+                continue
+            full_path = ref_wt / filepath
+            if not full_path.exists():
+                continue
+            content = full_path.read_text(errors="ignore")
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                continue
+            stack = list(ast.iter_child_nodes(tree))
+            while stack:
+                node = stack.pop()
+                if isinstance(node, ast.Call):
+                    calls.append((filepath, node.lineno - 1, node.end_lineno))
+                    # Do not recurse into call arguments - outermost calls only
+                else:
+                    stack.extend(ast.iter_child_nodes(node))
+
+        if not calls:
+            break
+        calls.sort()
+
+        state = BinaryState.create(len(calls))
+        _all_states = list(_state_iter(state))
+        _n_states = len(_all_states)
+        _it = iter(_all_states)
+        _dispatched = [0]
+        _it_lock = threading.Lock()
+
+        def _next():
+            with _it_lock:
+                s = next(_it, None)
+                if s is not None:
+                    _dispatched[0] += 1
+                return s
+
+        initial_commit = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        latest_commit: list[str] = [initial_commit]
+        latest_commit_lock = threading.Lock()
+        patch_queue: queue.Queue = queue.Queue()
+        producers_done = threading.Event()
+
+        def producer_worker(wt, i):
+            my_commit: str | None = None
+            no_cancel = threading.Event()
+            while True:
+                with latest_commit_lock:
+                    lc = latest_commit[0]
+                if lc != my_commit:
+                    if my_commit is not None:
+                        subprocess.run(["git", "reset", "--hard", lc], cwd=wt, capture_output=True)
+                    my_commit = lc
+                subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
+
+                s = _next()
+                if s is None:
+                    return
+                batch = [(fp, s0, e) for fp, s0, e in calls[s.index:s.end()] if (wt / fp).exists()]
+                if not batch:
+                    continue
+                pct = _dispatched[0] * 100 // _n_states
+                print(f"  [worker {i}] ({pct:3d}%) try {len(batch)} call(s)")
+                if _delete_call_ranges(wt, batch) and run_test(cmd, wt, no_cancel):
+                    patch_queue.put(batch)
+                restore_worktree(wt)
+
+        def applier_worker():
+            pending: list[list[tuple[str, int, int]]] = []
+            dummy = threading.Event()
+            while True:
+                try:
+                    while True:
+                        pending.append(patch_queue.get_nowait())
+                except queue.Empty:
+                    pass
+
+                if not pending:
+                    if producers_done.is_set() and patch_queue.empty():
+                        break
+                    time.sleep(0.05)
+                    continue
+
+                all_triples = [(fp, s, e) for batch in pending for fp, s, e in batch
+                               if (apply_wt / fp).exists()]
+                if not all_triples:
+                    pending = []
+                    continue
+
+                files_affected = sorted({fp for fp, _, _ in all_triples})
+                names = ", ".join(files_affected[:3]) + ("..." if len(files_affected) > 3 else "")
+
+                if not _delete_call_ranges(apply_wt, all_triples):
+                    pending = []
+                    continue
+
+                if run_test(cmd, apply_wt, dummy):
+                    msg = f"reduce: delete {len(all_triples)} call(s) in {names}"
+                    print(f"[+] {msg}")
+                    commit_hash = commit_change(apply_wt, msg)
+                    subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
+                    with latest_commit_lock:
+                        latest_commit[0] = commit_hash
+                    pending = []
+                else:
+                    restore_worktree(apply_wt)
+                    n_discard = max(1, len(pending) // 2)
+                    pending = pending[n_discard:]
+
+        producer_threads = [
+            threading.Thread(target=producer_worker, args=(producer_wts[i], i))
+            for i in range(n_producers)
+        ]
+        applier_thread = threading.Thread(target=applier_worker)
+        for t in producer_threads:
+            t.start()
+        applier_thread.start()
+        for t in producer_threads:
+            t.join()
+        producers_done.set()
+        applier_thread.join()
+
+        committed = latest_commit[0] != initial_commit
+        if committed:
+            sync_worktrees_to_commit(latest_commit[0], [repo] + worktrees)
+        else:
+            break
+
+
+# ---------------------------------------------------------------------------
 # Phase 1.5: reduce functions
 # ---------------------------------------------------------------------------
 
@@ -1209,6 +1373,10 @@ def main() -> None:
             while True:
                 cycle += 1
                 head_before = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+                print(f"\n[*] Phase 0 (cycle {cycle}): reducing calls...")
+                reduce_calls(files, repo, worktrees, cmd)
+                print("[*] Phase 0 done.")
 
                 if args.lines_only:
                     if cycle == 1:
