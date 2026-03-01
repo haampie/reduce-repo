@@ -154,7 +154,7 @@ def run_test(cmd: str, wt: Path, stop_event: threading.Event) -> bool:
 
     Polls stop_event every 50ms and terminates the subprocess early if set.
     """
-    with tempfile.TemporaryFile(mode='w+') as stdout_f, tempfile.TemporaryFile(mode='w+') as stderr_f:
+    with tempfile.TemporaryFile(mode='w+b') as stdout_f, tempfile.TemporaryFile(mode='w+b') as stderr_f:
         start = time.monotonic()  # ensure monotonic time for timeout
         proc = subprocess.Popen(
             cmd,
@@ -162,8 +162,6 @@ def run_test(cmd: str, wt: Path, stop_event: threading.Event) -> bool:
             cwd=wt,
             stdout=stdout_f,  # Capture stdout
             stderr=stderr_f,  # Capture stderr
-            text=True,        # Treat output as text
-            errors="replace", # Don't crash on decoding errors
         )
         while True:
             try:
@@ -182,8 +180,8 @@ def run_test(cmd: str, wt: Path, stop_event: threading.Event) -> bool:
             # Rewind files to read captured output
             stdout_f.seek(0)
             stderr_f.seek(0)
-            out = stdout_f.read().strip()
-            err = stderr_f.read().strip()
+            out = stdout_f.read().decode(errors="replace").strip()
+            err = stderr_f.read().decode(errors="replace").strip()
 
             # Build a debug message
             msg = [f"\n--- [SUCCESS] Test passed in {wt.name} in {time.monotonic() - start:.2f}s ---"]
