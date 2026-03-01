@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""reduce-repo.py — reduce a git repository to a minimal bug reproduction.
+"""reduce-repo.py - reduce a git repository to a minimal bug reproduction.
 
 Phase 1: delete entire tracked files
 Phase 2: delete lines within remaining files
@@ -24,7 +24,7 @@ import time
 
 
 # ---------------------------------------------------------------------------
-# BinaryState — pure-functional, frozen, thread-safe
+# BinaryState - pure-functional, frozen, thread-safe
 # ---------------------------------------------------------------------------
 
 
@@ -44,7 +44,7 @@ class BinaryState:
         return min(self.index + self.chunk, self.instances)
 
     def advance(self) -> "BinaryState | None":
-        # Walk backwards within the current chunk size (end → start).
+        # Walk backwards within the current chunk size (end -> start).
         if self.index >= self.chunk:
             return BinaryState(
                 instances=self.instances, chunk=self.chunk, index=self.index - self.chunk
@@ -65,8 +65,8 @@ def _state_iter(state: "BinaryState | None"):
       [0:N], [N/2:N], [0:N/2], [3N/4:N], [N/2:3N/4], [N/4:N/2], [0:N/4], ...
 
     With N persistent workers pulling from this iterator, round 1 launches:
-      worker 0 → chunk=all, worker 1 → chunk=last-half,
-      worker 2 → chunk=first-half, worker 3 → chunk=last-quarter.
+      worker 0 -> chunk=all, worker 1 -> chunk=last-half,
+      worker 2 -> chunk=first-half, worker 3 -> chunk=last-quarter.
     """
     s = state
     while s is not None:
@@ -125,7 +125,7 @@ def remove_worktrees(repo: Path, worktrees: list[Path]) -> None:
 
 
 def restore_worktree(wt: Path) -> None:
-    """Bring worktree to exact match of HEAD — remove test artifacts, restore tracked files."""
+    """Bring worktree to exact match of HEAD - remove test artifacts, restore tracked files."""
     subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
     subprocess.run(["git", "checkout", "HEAD", "--", "."], cwd=wt, capture_output=True)
 
@@ -442,7 +442,7 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     first_line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
                     funcs.append((filepath, first_line - 1, node.end_lineno))
-                    # Do not recurse into the function body — only outer functions
+                    # Do not recurse into the function body - only outer functions
                 else:
                     stack.extend(ast.iter_child_nodes(node))
 
@@ -582,7 +582,7 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
     n = len(worktrees)
     ref_wt = worktrees[0]
     apply_wt = worktrees[-1]       # dedicated applier worktree
-    producer_wts = worktrees[:-1]  # n−1 producer worktrees
+    producer_wts = worktrees[:-1]  # n-1 producer worktrees
     n_producers = len(producer_wts)
     assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
     failed_pairs: set[tuple[str, int, int]] = set()
@@ -900,7 +900,7 @@ def main() -> None:
         type=float,
         default=0.05,
         metavar="F",
-        help="randomize each chunk end by ±F fraction of chunk size (default: 0.05)",
+        help="randomize each chunk end by +/-F fraction of chunk size (default: 0.05)",
     )
     parser.add_argument(
         "repo",

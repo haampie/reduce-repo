@@ -28,7 +28,7 @@ def test_out_of_bounds_end():
 
 
 def test_invalid_interval_skipped():
-    assert _apply_deletions(LINES, [(3, 2)]) == LINES   # s >= e → no-op
+    assert _apply_deletions(LINES, [(3, 2)]) == LINES   # s >= e -> no-op
 
 
 def test_empty_intervals():

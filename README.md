@@ -12,19 +12,19 @@ the progress and the result is always a valid repo.
 
 Reduction runs as a fixed-point loop over three phases:
 
-1. **Phase 1 — file deletion**: tries deleting each tracked file; keeps
+1. **Phase 1 - file deletion**: tries deleting each tracked file; keeps
    deletions that leave the test passing.
-2. **Phase 1.5 — function deletion**: tries deleting Python functions/methods
+2. **Phase 1.5 - function deletion**: tries deleting Python functions/methods
    (including decorators) one at a time.
-3. **Phase 2 — line deletion**: tries deleting contiguous chunks of lines
+3. **Phase 2 - line deletion**: tries deleting contiguous chunks of lines
    within each file, from coarse (whole file) down to fine (single line),
    using a depth-major binary-search strategy across all files in parallel.
 
 Each phase loops internally until it can make no further progress. The three
 phases are then repeated as an outer fixed-point loop until a full cycle
-produces no new commits — ensuring that reductions in one phase can unlock
-further reductions in another (e.g. phase 2 empties a file → phase 1 deletes
-it → phase 1.5 removes a now-dead import).
+produces no new commits, ensuring that reductions in one phase can unlock
+further reductions in another (e.g. phase 2 empties a file -> phase 1 deletes
+it -> phase 1.5 removes a now-dead import).
 
 Within phase 2, an `(file, start, end)` cache skips line ranges that are known
 to still fail for unchanged files. Before giving up, one final sweep clears the
@@ -65,7 +65,7 @@ bug is gone.
 | `-c COMMAND` | *(required)* | Interestingness test command |
 | `-n N` | `4` | Number of parallel workers |
 | `--lines-only` | off | Skip file deletion (phase 1), go straight to line reduction |
-| `--jitter F` | `0.05` | Randomise each chunk boundary by ±F × chunk size |
+| `--jitter F` | `0.05` | Randomise each chunk boundary by +/-F x chunk size |
 
 ### Example
 

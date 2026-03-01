@@ -54,7 +54,7 @@ if ! git -C "$REPO" log --oneline | grep -q "delete.*function"; then
     exit 1
 fi
 
-# The noise functions must be gone — including their decorator lines
+# The noise functions must be gone - including their decorator lines
 if grep -qE "noise1|noise2|noise3|some_decorator|another_decorator" "$REPO/lib.py"; then
     echo "FAIL: noise functions (or their decorators) still present in lib.py"
     cat "$REPO/lib.py"
