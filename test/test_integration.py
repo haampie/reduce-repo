@@ -17,3 +17,8 @@ def test_reduce_functions():
 def test_reduce_lines_odd_pair():
     r = subprocess.run(["bash", TEST_DIR / "reduce_lines_odd_pair.bash"], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_truncate_files():
+    r = subprocess.run(["bash", TEST_DIR / "truncate_files.bash"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
