@@ -273,8 +273,16 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
     n_producers = len(producer_wts)
     assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
 
+    next_start_chunk = None
     while True:
-        state = BinaryState.create(len(files))
+        N = len(files)
+        sc = min(next_start_chunk, N) if next_start_chunk else N
+        next_start_chunk = None
+        if sc >= N:
+            state = BinaryState.create(N)
+        else:
+            last_idx = ((N - 1) // sc) * sc
+            state = BinaryState(instances=N, chunk=sc, index=last_idx)
         if state is None:
             break
 
@@ -283,9 +291,12 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
         _it = iter(_all_states)
         _dispatched = [0]
         _it_lock = threading.Lock()
+        restart_event = threading.Event()
 
         def _next():
             with _it_lock:
+                if restart_event.is_set():
+                    return None
                 s = next(_it, None)
                 if s is not None:
                     _dispatched[0] += 1
@@ -326,12 +337,16 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
                     (wt / f).unlink(missing_ok=True)
                 git(["rm", "--cached", "--ignore-unmatch", "--"] + to_delete, cwd=wt)
                 if run_test(cmd, wt, no_cancel):
-                    patch_queue.put(to_delete)
+                    patch_queue.put((to_delete, s.chunk))
                 restore_worktree(wt)
 
+        restart_chunk_size = [None]
+
         def applier_worker():
-            pending: list[list[str]] = []
+            pending: list[tuple[list[str], int]] = []
             dummy = threading.Event()
+            min_successful_chunk: int = N
+            n_applied = 0
             while True:
                 try:
                     while True:
@@ -345,7 +360,7 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
                     time.sleep(0.05)
                     continue
 
-                files_to_delete = sorted({f for batch in pending for f in batch if (apply_wt / f).exists()})
+                files_to_delete = sorted({f for batch, _c in pending for f in batch if (apply_wt / f).exists()})
                 if not files_to_delete:
                     pending = []
                     continue
@@ -363,7 +378,13 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
                     subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
                     with latest_commit_lock:
                         latest_commit[0] = commit_hash
+                    batch_min = min(c for _, c in pending)
+                    min_successful_chunk = min(min_successful_chunk, batch_min)
                     pending = []
+                    n_applied += 1
+                    if n_applied >= 8:
+                        restart_chunk_size[0] = min_successful_chunk * 2
+                        restart_event.set()
                 else:
                     restore_worktree(apply_wt)
                     n_discard = max(1, len(pending) // 2)
@@ -385,6 +406,7 @@ def reduce_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) 
         if all_deleted:
             last_commit = latest_commit[0]
             sync_worktrees_to_commit(last_commit, [repo] + worktrees)
+            next_start_chunk = restart_chunk_size[0]
             files = [f for f in files if f not in set(all_deleted)]
         else:
             break
@@ -554,6 +576,150 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
             sync_worktrees_to_commit(latest_commit[0], [repo] + worktrees)
         else:
             break
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.75: reduce empty lines
+# ---------------------------------------------------------------------------
+
+
+def _has_empty_lines(path: Path) -> bool:
+    try:
+        return any(not l.strip() for l in path.read_text(errors="ignore").splitlines())
+    except OSError:
+        return False
+
+
+def _strip_empty_lines(wt: Path, batch: list[str]) -> bool:
+    """Remove empty/whitespace-only lines from each file in batch.
+    Returns True if any file was changed and staged."""
+    changed = False
+    for fp in batch:
+        full_path = wt / fp
+        if not full_path.exists():
+            continue
+        lines = full_path.read_text(errors="ignore").splitlines(keepends=True)
+        new_lines = [l for l in lines if l.strip()]
+        if new_lines == lines:
+            continue
+        full_path.write_text("".join(new_lines))
+        git(["add", "--", fp], cwd=wt)
+        changed = True
+    return changed
+
+
+def reduce_empty_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> None:
+    """Remove empty/whitespace-only lines from files until no further reduction is possible."""
+    apply_wt = worktrees[-1]
+    producer_wts = worktrees[:-1]
+    n_producers = len(producer_wts)
+    assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
+    ref_wt = worktrees[0]
+
+    targets = [f for f in files if (ref_wt / f).exists() and _has_empty_lines(ref_wt / f)]
+    state = BinaryState.create(len(targets))
+    if state is None:
+        return
+
+    _all_states = list(_state_iter(state))
+    _n_states = len(_all_states)
+    _it = iter(_all_states)
+    _dispatched = [0]
+    _it_lock = threading.Lock()
+
+    def _next():
+        with _it_lock:
+            s = next(_it, None)
+            if s is not None:
+                _dispatched[0] += 1
+            return s
+
+    initial_commit = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    latest_commit: list[str] = [initial_commit]
+    latest_commit_lock = threading.Lock()
+    patch_queue: queue.Queue = queue.Queue()
+    producers_done = threading.Event()
+
+    def producer_worker(wt, i):
+        my_commit: str | None = None
+        no_cancel = threading.Event()
+        while True:
+            with latest_commit_lock:
+                lc = latest_commit[0]
+            if lc != my_commit:
+                if my_commit is not None:
+                    subprocess.run(["git", "reset", "--hard", lc], cwd=wt, capture_output=True)
+                my_commit = lc
+            subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
+
+            s = _next()
+            if s is None:
+                return
+            batch = [f for f in targets[s.index:s.end()] if (wt / f).exists()]
+            if not batch:
+                continue
+            pct = _dispatched[0] * 100 // _n_states
+            print(f"  [worker {i}] ({pct:3d}%) strip empty lines from {len(batch)} file(s)")
+            if _strip_empty_lines(wt, batch) and run_test(cmd, wt, no_cancel):
+                patch_queue.put(batch)
+            restore_worktree(wt)
+
+    def applier_worker():
+        pending: list[list[str]] = []
+        dummy = threading.Event()
+        while True:
+            try:
+                while True:
+                    pending.append(patch_queue.get_nowait())
+            except queue.Empty:
+                pass
+
+            if not pending:
+                if producers_done.is_set() and patch_queue.empty():
+                    break
+                time.sleep(0.05)
+                continue
+
+            all_files = sorted({f for batch in pending for f in batch if (apply_wt / f).exists()})
+            if not all_files:
+                pending = []
+                continue
+
+            names = ", ".join(all_files[:3]) + ("..." if len(all_files) > 3 else "")
+
+            if not _strip_empty_lines(apply_wt, all_files):
+                pending = []
+                continue
+
+            if run_test(cmd, apply_wt, dummy):
+                msg = f"reduce: strip empty lines from {len(all_files)} file(s): {names}"
+                print(f"[+] {msg}")
+                commit_hash = commit_change(apply_wt, msg)
+                subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
+                with latest_commit_lock:
+                    latest_commit[0] = commit_hash
+                pending = []
+            else:
+                restore_worktree(apply_wt)
+                n_discard = max(1, len(pending) // 2)
+                pending = pending[n_discard:]
+
+    producer_threads = [
+        threading.Thread(target=producer_worker, args=(producer_wts[i], i))
+        for i in range(n_producers)
+    ]
+    applier_thread = threading.Thread(target=applier_worker)
+    for t in producer_threads:
+        t.start()
+    applier_thread.start()
+    for t in producer_threads:
+        t.join()
+    producers_done.set()
+    applier_thread.join()
+
+    committed = latest_commit[0] != initial_commit
+    if committed:
+        sync_worktrees_to_commit(latest_commit[0], [repo] + worktrees)
 
 
 # ---------------------------------------------------------------------------
@@ -955,6 +1121,10 @@ def main() -> None:
                 print(f"\n[*] Phase 1.5 (cycle {cycle}): reducing functions...")
                 reduce_functions(files, repo, worktrees, cmd)
                 print("[*] Phase 1.5 done.")
+
+                print(f"\n[*] Phase 1.75 (cycle {cycle}): reducing empty lines...")
+                reduce_empty_lines(files, repo, worktrees, cmd)
+                print("[*] Phase 1.75 done.")
 
                 print(f"\n[*] Phase 2 (cycle {cycle}): reducing lines...")
                 reduce_lines(files, repo, worktrees, cmd, jitter=args.jitter, min_chunk_size=16 if cycle == 1 else 1)
