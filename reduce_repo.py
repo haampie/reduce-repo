@@ -454,16 +454,21 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
             full_path = ref_wt / filepath
             if not full_path.exists():
                 continue
+            content = full_path.read_text(errors="ignore")
             try:
-                tree = ast.parse(full_path.read_text(errors="ignore"))
+                tree = ast.parse(content)
             except SyntaxError:
                 continue
+            lines_list = content.splitlines()
             stack = list(ast.iter_child_nodes(tree))
             while stack:
                 node = stack.pop()
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     first_line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
-                    funcs.append((filepath, first_line - 1, node.end_lineno))
+                    end = node.end_lineno  # 0-indexed exclusive end
+                    while end < len(lines_list) and not lines_list[end].strip():
+                        end += 1
+                    funcs.append((filepath, first_line - 1, end))
                     # Do not recurse into the function body - only outer functions
                 else:
                     stack.extend(ast.iter_child_nodes(node))
@@ -770,35 +775,6 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
         if not file_lines:
             break
 
-        # Blank-line pass: delete all blank/whitespace-only lines at once.
-        blank_deletions: dict[str, list[int]] = {}
-        for filepath, lines in file_lines.items():
-            idxs = [i for i, ln in enumerate(lines) if not ln.strip()]
-            if idxs:
-                blank_deletions[filepath] = idxs
-
-        if blank_deletions:
-            for fp, idxs in blank_deletions.items():
-                idx_set = set(idxs)
-                new_lines = [ln for i, ln in enumerate(file_lines[fp]) if i not in idx_set]
-                (apply_wt / fp).write_text("".join(new_lines))
-                git(["add", "--", fp], cwd=apply_wt)
-            total = sum(len(v) for v in blank_deletions.values())
-            print(f"  [blank pass] {total} blank line(s) across {len(blank_deletions)} file(s)")
-            dummy = threading.Event()
-            if run_test(cmd, apply_wt, dummy):
-                msg = f"reduce: remove {total} blank line(s)"
-                print(f"[+] {msg}")
-                commit_hash = commit_change(apply_wt, msg)
-                sync_worktrees_to_commit(commit_hash, [repo] + worktrees)
-                with latest_commit_lock:
-                    latest_commit[0] = commit_hash
-                changed = set(blank_deletions)
-                failed_pairs -= {k for k in failed_pairs if k[0] in changed}
-                continue  # restart outer loop; re-read file_lines
-            else:
-                restore_worktree(apply_wt)
-
         # Sort files largest-first so the most impactful deletions appear first.
         sorted_files = sorted(file_lines, key=lambda fp: len(file_lines[fp]), reverse=True)
 
@@ -863,10 +839,6 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                         end = max(s.index + 1, min(len(lines), raw_end + delta))
                     else:
                         end = raw_end
-                    # heuristic, class Foo is typically in the first 10 lines.
-                    # Exception: 0:N (whole file) is always tried.
-                    if s.index == 0 and end > 10 and end < n:
-                        continue
                     key = (filepath, s.index, end)
                     if key not in failed_pairs:
                         task_list.append((filepath, s.index, end, lines))
@@ -1127,12 +1099,13 @@ def main() -> None:
                 print("[*] Phase 1.75 done.")
 
                 print(f"\n[*] Phase 2 (cycle {cycle}): reducing lines...")
-                reduce_lines(files, repo, worktrees, cmd, jitter=args.jitter, min_chunk_size=16 if cycle == 1 else 1)
+                reduce_lines(files, repo, worktrees, cmd, jitter=args.jitter,
+                             min_chunk_size=16 if cycle == 1 else 1)  # coarse first pass; fine-grained on cycle 2+
                 print("[*] Phase 2 done.")
 
                 head_after = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
                 if head_after == head_before and cycle >= 2:
-                    break  # fixed point: full cycle produced no new commits
+                    break  # cycle 1 uses coarse chunks, so always allow a cycle-2 fine-grained pass
                 print(f"\n[*] Cycle {cycle} made progress; restarting phase cycle...")
 
         finally:
