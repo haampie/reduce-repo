@@ -563,7 +563,7 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
 # ---------------------------------------------------------------------------
 
 
-def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, restart_after: int = 8, jitter: float = 0.05) -> None:
+def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, jitter: float = 0.05) -> None:
     """Delete lines within files until no further reduction is possible.
 
     Uses depth-major ordering: all files are processed at depth 0 (whole-file
@@ -579,9 +579,7 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
 
     Already-failed (filepath, start, end) triples are remembered in failed_pairs
     and skipped in subsequent passes. On success, failed_pairs entries for the
-    changed file(s) are cleared so their new content gets a fresh look. After
-    restart_after consecutive successes the entire set is cleared, allowing a
-    coarse-level sweep to find chunks that are newly removable.
+    changed file(s) are cleared so their new content gets a fresh look.
     """
     n = len(worktrees)
     ref_wt = worktrees[0]
@@ -591,9 +589,9 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
     assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
     failed_pairs: set[tuple[str, int, int]] = set()
     failed_pairs_lock = threading.Lock()
-    successes_since_restart = 0
     latest_commit: list[str] = [git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()]
     latest_commit_lock = threading.Lock()
+    did_final_sweep = False
 
     while True:
         # Build per-file line lists (skip empty / binary / missing)
@@ -634,10 +632,7 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                     latest_commit[0] = commit_hash
                 changed = set(blank_deletions)
                 failed_pairs -= {k for k in failed_pairs if k[0] in changed}
-                successes_since_restart += 1
-                if successes_since_restart >= restart_after:
-                    successes_since_restart = 0
-                    failed_pairs.clear()
+                did_final_sweep = False
                 continue  # restart outer loop; re-read file_lines
             else:
                 restore_worktree(apply_wt)
@@ -823,15 +818,18 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                 with latest_commit_lock:
                     latest_commit[0] = last_commit
                 failed_pairs -= {k for k in failed_pairs if k[0] in depth_changed_files}
-                successes_since_restart += len(depth_applier_commits)
-                if successes_since_restart >= restart_after:
-                    successes_since_restart = 0
-                    failed_pairs.clear()
                 found = True
                 break
 
         if not found:
+            if not did_final_sweep and failed_pairs:
+                # One last sweep with all caches cleared before giving up;
+                # cross-file changes may have made previously-failed tasks feasible.
+                did_final_sweep = True
+                failed_pairs.clear()
+                continue
             break
+        did_final_sweep = False  # progress made; future termination will retry
 
 
 # ---------------------------------------------------------------------------
@@ -900,13 +898,6 @@ def main() -> None:
         help="skip Phase 1 (file deletion) and go straight to line reduction",
     )
     parser.add_argument(
-        "--restart-after",
-        type=int,
-        default=8,
-        metavar="N",
-        help="restart to coarsest chunks after N successful reductions (default: 8)",
-    )
-    parser.add_argument(
         "--jitter",
         type=float,
         default=0.05,
@@ -949,23 +940,31 @@ def main() -> None:
         worktrees = create_worktrees(repo, n, parent)
 
         try:
-            # Phase 1: file deletion
-            if args.lines_only:
-                print("\n[*] Phase 1 skipped (--lines-only).")
-            else:
-                print("\n[*] Phase 1: reducing files...")
-                files = reduce_files(files, repo, worktrees, cmd)
-                print(f"[*] Phase 1 done. Files remaining: {len(files)}")
+            cycle = 0
+            while True:
+                cycle += 1
+                head_before = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
 
-            # Phase 1.5: function deletion
-            print("\n[*] Phase 1.5: reducing functions...")
-            reduce_functions(files, repo, worktrees, cmd)
-            print("[*] Phase 1.5 done.")
+                if args.lines_only:
+                    if cycle == 1:
+                        print("\n[*] Phase 1 skipped (--lines-only).")
+                else:
+                    print(f"\n[*] Phase 1 (cycle {cycle}): reducing files...")
+                    files = reduce_files(files, repo, worktrees, cmd)
+                    print(f"[*] Phase 1 done. Files remaining: {len(files)}")
 
-            # Phase 2: line deletion
-            print("\n[*] Phase 2: reducing lines...")
-            reduce_lines(files, repo, worktrees, cmd, restart_after=args.restart_after, jitter=args.jitter)
-            print("[*] Phase 2 done.")
+                print(f"\n[*] Phase 1.5 (cycle {cycle}): reducing functions...")
+                reduce_functions(files, repo, worktrees, cmd)
+                print("[*] Phase 1.5 done.")
+
+                print(f"\n[*] Phase 2 (cycle {cycle}): reducing lines...")
+                reduce_lines(files, repo, worktrees, cmd, jitter=args.jitter)
+                print("[*] Phase 2 done.")
+
+                head_after = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
+                if head_after == head_before:
+                    break  # fixed point: full cycle produced no new commits
+                print(f"\n[*] Cycle {cycle} made progress; restarting phase cycle...")
 
         finally:
             print(f"\n[*] Removing worktrees...")
