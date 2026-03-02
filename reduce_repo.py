@@ -1026,10 +1026,6 @@ def reduce_lines(
     the combined test passes. On failure it discards the oldest half of its
     accumulated patches and retries. Producers sync to the latest commit before
     each task so stale patches are self-correcting.
-
-    Already-failed (filepath, start, end) triples are remembered in failed_pairs
-    and skipped in subsequent passes. On success, failed_pairs entries for the
-    changed file(s) are cleared so their new content gets a fresh look.
     """
     n = len(worktrees)
     ref_wt = worktrees[0]
@@ -1037,8 +1033,6 @@ def reduce_lines(
     producer_wts = worktrees[:-1]  # n-1 producer worktrees
     n_producers = len(producer_wts)
     assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
-    failed_pairs: set[tuple[str, int, int]] = set()
-    failed_pairs_lock = threading.Lock()
     latest_commit: list[str] = [git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()]
     latest_commit_lock = threading.Lock()
 
@@ -1106,8 +1100,7 @@ def reduce_lines(
         for depth in range(len(ref_chunk_sizes)):
             if ref_chunk_sizes[depth] < min_chunk_size:
                 break
-            # Build task list for this depth across all files (largest-first),
-            # skipping (filepath, start, end) triples that already failed.
+            # Build task list for this depth across all files (largest-first).
             task_list = []
             has_any_at_depth = False
             for filepath in sorted_files:
@@ -1124,9 +1117,7 @@ def reduce_lines(
                         end = max(s.index + 1, min(len(lines), raw_end + delta))
                     else:
                         end = raw_end
-                    key = (filepath, s.index, end)
-                    if key not in failed_pairs:
-                        task_list.append((filepath, s.index, end, lines))
+                    task_list.append((filepath, s.index, end, lines))
 
             if not has_any_at_depth:
                 continue  # no file has content at this chunk granularity; try next depth
@@ -1154,6 +1145,11 @@ def reduce_lines(
             def producer_worker(wt, i):
                 no_cancel = threading.Event()  # producers never cancel each other
                 my_commit: str | None = None
+
+                # Track speculative progress local to this worker
+                local_dels: dict[str, list[tuple[int, int]]] = {}
+                head_lines_cache: dict[str, list[str]] = {}
+
                 while True:
                     # Sync worktree to latest commit before each task
                     with latest_commit_lock:
@@ -1166,6 +1162,11 @@ def reduce_lines(
                                 capture_output=True,
                             )
                         my_commit = lc
+                        # Reset local speculations since we moved to a new baseline
+                        local_dels.clear()
+                        head_lines_cache.clear()
+
+                    # This only removes untracked build artifacts, keeping tracked file changes
                     subprocess.run(
                         ["git", "clean", "-fdx", "."], cwd=wt, capture_output=True
                     )
@@ -1173,20 +1174,44 @@ def reduce_lines(
                     task = _next_task()
                     if task is None:
                         return
-                    filepath, start, end, lines = task
-                    remaining = lines[:start] + lines[end:]
+                    filepath, start, end, original_lines = task
                     removed = end - start
+
+                    # Cache the baseline file state for this commit once
+                    if filepath not in head_lines_cache:
+                        head_lines_cache[filepath] = (
+                            (wt / filepath)
+                            .read_text(errors="ignore")
+                            .splitlines(keepends=True)
+                        )
+                    base_lines = head_lines_cache[filepath]
+
+                    # Combine previously accepted speculative patches + current task
+                    current_dels = local_dels.get(filepath, []).copy()
+                    current_dels.append((start, end))
+
+                    # Apply all of them simultaneously to ensure absolute indices work correctly
+                    remaining = _apply_deletions(base_lines, current_dels)
+
                     pct = _dispatched[0] * 100 // _n_tasks
                     print(
                         f"  [worker {i}] ({pct:3d}%) {filepath}: remove {removed} line(s) [{start}:{end}]"
                     )
                     (wt / filepath).write_text("".join(remaining))
+
                     if run_test(cmd, wt, no_cancel):
-                        patch_queue.put((filepath, start, end, removed, lines))
+                        # SUCCESS: Remember the local patch and push to the queue
+                        local_dels.setdefault(filepath, []).append((start, end))
+                        patch_queue.put((filepath, start, end, removed, original_lines))
                     else:
-                        with failed_pairs_lock:
-                            failed_pairs.add((filepath, start, end))
-                    restore_worktree(wt)
+                        # FAILURE: Revert this file to its previous speculative state
+                        prev_remaining = _apply_deletions(
+                            base_lines, local_dels.get(filepath, [])
+                        )
+                        (wt / filepath).write_text("".join(prev_remaining))
+
+                    # CRITICAL: Do NOT call restore_worktree(wt) here anymore!
+                    # Passing modifications need to stay in the worktree for the next loop.
 
             def applier_worker():
                 pending: list = []  # (filepath, start, end, removed, lines)
@@ -1205,16 +1230,24 @@ def reduce_lines(
                         time.sleep(0.05)
                         continue
 
-                    # Combine patches: group by file, apply all deletions per file
-                    # using the lines snapshot embedded in each patch.
-                    file_dels: dict[str, tuple[list[str], list[tuple[int, int]]]] = {}
-                    for fp, s, e, _, lines in pending:
+                    # Combine patches: group by file, discard original lines, keep only absolute indices
+                    file_dels: dict[str, list[tuple[int, int]]] = {}
+                    for fp, s, e, _, _ in pending:
                         if fp not in file_dels:
-                            file_dels[fp] = (lines, [])
-                        file_dels[fp][1].append((s, e))
+                            file_dels[fp] = []
+                        file_dels[fp].append((s, e))
 
-                    for fp, (lines, dels) in file_dels.items():
-                        new_lines = _apply_deletions(lines, dels)
+                    for fp, dels in file_dels.items():
+                        # FIX: Read the CURRENT file from disk (which includes previous commits)
+                        current_lines = (
+                            (apply_wt / fp)
+                            .read_text(errors="ignore")
+                            .splitlines(keepends=True)
+                        )
+
+                        # Apply the batch's indices blindly. If indices shift destructively,
+                        # the test suite will fail it, and the batch logic drops half.
+                        new_lines = _apply_deletions(current_lines, dels)
                         (apply_wt / fp).write_text("".join(new_lines))
                         git(["add", "--", fp], cwd=apply_wt)
 
@@ -1234,6 +1267,8 @@ def reduce_lines(
                     else:
                         n_discard = max(1, len(pending) // 2)
                         pending = pending[n_discard:]
+
+                    # This resets apply_wt to HEAD, clearing any broken merge-conflict attempts
                     restore_worktree(apply_wt)
 
             producer_threads = [
@@ -1255,7 +1290,6 @@ def reduce_lines(
                 sync_worktrees_to_commit(last_commit, [repo] + worktrees)
                 with latest_commit_lock:
                     latest_commit[0] = last_commit
-                failed_pairs -= {k for k in failed_pairs if k[0] in depth_changed_files}
                 found = True
                 break
 
