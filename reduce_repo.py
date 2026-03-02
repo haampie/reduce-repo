@@ -510,9 +510,12 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
         _it = iter(_all_states)
         _dispatched = [0]
         _it_lock = threading.Lock()
+        restart_event = threading.Event()
 
         def _next():
             with _it_lock:
+                if restart_event.is_set():
+                    return None
                 s = next(_it, None)
                 if s is not None:
                     _dispatched[0] += 1
@@ -523,6 +526,7 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
         latest_commit_lock = threading.Lock()
         patch_queue: queue.Queue = queue.Queue()
         producers_done = threading.Event()
+        restart_chunk_size = [None]
 
         def producer_worker(wt, i):
             my_commit: str | None = None
@@ -545,12 +549,14 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
                 pct = _dispatched[0] * 100 // _n_states
                 print(f"  [worker {i}] ({pct:3d}%) try {len(batch)} item(s)")
                 if _delete_ranges(wt, batch) and run_test(cmd, wt, no_cancel):
-                    patch_queue.put(batch)
+                    patch_queue.put((batch, s.chunk))
                 restore_worktree(wt)
 
         def applier_worker():
-            pending: list[list[tuple[str, int, int]]] = []
+            pending: list[tuple[list[tuple[str, int, int]], int]] = []
             dummy = threading.Event()
+            min_successful_chunk: int = len(items)
+            n_applied = 0
             while True:
                 try:
                     while True:
@@ -564,7 +570,7 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
                     time.sleep(0.05)
                     continue
 
-                all_triples = [(fp, s, e) for batch in pending for fp, s, e in batch
+                all_triples = [(fp, s, e) for batch, _c in pending for fp, s, e in batch
                                if (apply_wt / fp).exists()]
                 if not all_triples:
                     pending = []
@@ -591,7 +597,13 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
                     subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
                     with latest_commit_lock:
                         latest_commit[0] = commit_hash
+                    batch_min = min(c for _, c in pending)
+                    min_successful_chunk = min(min_successful_chunk, batch_min)
                     pending = []
+                    n_applied += 1
+                    if n_applied >= 4:
+                        restart_chunk_size[0] = min_successful_chunk * 2
+                        restart_event.set()
                 else:
                     restore_worktree(apply_wt)
                     n_discard = max(1, len(pending) // 2)
@@ -613,6 +625,9 @@ def reduce_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: s
         committed = latest_commit[0] != initial_commit
         if committed:
             sync_worktrees_to_commit(latest_commit[0], [repo] + worktrees)
+            # If restart was triggered, loop again to re-collect items
+            if restart_chunk_size[0] is not None:
+                continue
         else:
             break
 
