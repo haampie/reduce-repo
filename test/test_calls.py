@@ -27,7 +27,7 @@ def test_calls_collected():
     defs, calls = _collect_funcs_and_calls(tree, "example.py", lines_list)
     # top_level() at module level and class_call() in class body
     assert len(calls) == 2
-    call_lines = [source.splitlines()[s] for _, s, _ in calls]
+    call_lines = [source.splitlines()[s] for _, s, _, _ in calls]
     assert any("top_level()" in l for l in call_lines)
     assert any("class_call()" in l for l in call_lines)
 
@@ -40,7 +40,7 @@ def test_method_body_excluded():
     print(defs, calls)
     # inner_call() and method_call() are inside function bodies — must not appear as separate calls
     call_lines = set()
-    for _, s, e in calls:
+    for _, s, e, _ in calls:
         call_lines.update(range(s, e))
     for i, line in enumerate(source.splitlines()):
         if "inner_call()" in line or "method_call()" in line:

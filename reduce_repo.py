@@ -283,9 +283,17 @@ def _apply_deletions(lines: list[str], intervals: list[tuple[int, int]]) -> list
 # ---------------------------------------------------------------------------
 
 
+def _get_call_name(call_node: ast.Call) -> str:
+    """Extract function name from simple calls, empty string otherwise."""
+    func = call_node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    return ""
+
+
 def _collect_funcs_and_calls(
     tree: ast.AST, filepath: str, lines_list: list[str]
-) -> tuple[list[tuple[str, int, int]], list[tuple[str, int, int]]]:
+) -> tuple[list[tuple[str, int, int]], list[tuple[str, int, int, str]]]:
     """Return (function_defs, function_calls).
 
     Traverses the AST with a stack. Does NOT recurse into FunctionDef/
@@ -293,10 +301,10 @@ def _collect_funcs_and_calls(
     top-level (outer) definitions and calls are collected.
 
     function_defs: (filepath, start0, end1) including decorators and trailing blank lines.
-    function_calls: (filepath, start0, end1) for bare call statements.
+    function_calls: (filepath, start0, end1, func_name) for bare call statements.
     """
     function_defs: list[tuple[str, int, int]] = []
-    function_calls: list[tuple[str, int, int]] = []
+    function_calls: list[tuple[str, int, int, str]] = []
     stack = list(ast.iter_child_nodes(tree))
     while stack:
         node = stack.pop()
@@ -310,7 +318,9 @@ def _collect_funcs_and_calls(
             function_defs.append((filepath, first_line - 1, end))
             # Do not recurse into function body
         elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-            function_calls.append((filepath, node.lineno - 1, node.end_lineno))
+            function_calls.append(
+                (filepath, node.lineno - 1, node.end_lineno, _get_call_name(node.value))
+            )
             # Do not recurse into the call expression
         else:
             stack.extend(ast.iter_child_nodes(node))
@@ -407,14 +417,10 @@ def reduce_files_and_functions(
             all_defs.extend(defs)
             all_calls.extend(calls)
 
-        # Shuffle the calls in blocks of MIN_FUNC_CHUNK so we're likely to delete from multiple files instead
-        # of all calls from the same file.
-        block_calls = [
-            all_calls[i : i + MIN_FUNC_CHUNK]
-            for i in range(0, len(all_calls), MIN_FUNC_CHUNK)
-        ]
-        random.shuffle(block_calls)
-        all_calls = list(itertools.chain.from_iterable(block_calls))
+        # Sort calls by function name to group related calls together for more effective deletion.
+        all_calls.sort(key=lambda c: c[3])
+        # Drop the function name; rest of the code expects 3-tuples.
+        all_calls = [(fp, s, e) for fp, s, e, _ in all_calls]
 
         files = current_files
         funcs_items = [("FUNC", *t) for t in all_defs] + [
