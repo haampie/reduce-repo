@@ -16,7 +16,10 @@ git config user.name "test"
 cat > lib.py <<'EOF'
 # BUG
 class Noise:
-    noise()
+    noise1()
+    noise2()
+    noise3()
+    noise4()
 EOF
 
 git add .
@@ -39,9 +42,9 @@ if ! git -C "$REPO" log --oneline | grep -qE "reduce: delete.*call"; then
     exit 1
 fi
 
-# The noise() call must be gone
-if grep -q "noise()" "$REPO/lib.py"; then
-    echo "FAIL: noise() call still present in lib.py"
+# The noise calls must be gone
+if grep -qE "noise[0-9]\(\)" "$REPO/lib.py"; then
+    echo "FAIL: noise calls still present in lib.py"
     cat "$REPO/lib.py"
     exit 1
 fi
@@ -53,4 +56,4 @@ if ! grep -q "# BUG" "$REPO/lib.py"; then
     exit 1
 fi
 
-echo "PASS: phase 0 removed noise() call, kept # BUG line"
+echo "PASS: phase 0 removed noise calls, kept # BUG line"

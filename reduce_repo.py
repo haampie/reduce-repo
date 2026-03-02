@@ -19,12 +19,15 @@ import tempfile
 import queue
 import threading
 from dataclasses import dataclass
-from itertools import groupby, dropwhile
+from itertools import groupby
 from pathlib import Path
 import time
 
 #: Number of consecutive successful reductions before restarting with larger chunk sizes.
 RETRY_AFTER = 8
+
+#: Min chunk size for function/call deletions. Smaller chunks are often overhead
+MIN_FUNC_CHUNK = 4
 
 
 # ---------------------------------------------------------------------------
@@ -404,9 +407,9 @@ def reduce_files_and_functions(
             all_defs.extend(defs)
             all_calls.extend(calls)
 
-        # Shuffle the calls in blocks of 4 so we're likely to delete from multiple files instead
+        # Shuffle the calls in blocks of MIN_FUNC_CHUNK so we're likely to delete from multiple files instead
         # of all calls from the same file.
-        block_calls = [all_calls[i : i + 4] for i in range(0, len(all_calls), 4)]
+        block_calls = [all_calls[i : i + MIN_FUNC_CHUNK] for i in range(0, len(all_calls), MIN_FUNC_CHUNK)]
         random.shuffle(block_calls)
         all_calls = list(itertools.chain.from_iterable(block_calls))
 
@@ -426,6 +429,7 @@ def reduce_files_and_functions(
 
         states_files = _get_states(N_files, start_chunk_files)
         states_funcs = _get_states(N_funcs, start_chunk_funcs)
+        states_funcs = [s for s in states_funcs if s.chunk >= MIN_FUNC_CHUNK]
 
         # Build an interleaved task queue of independent bisection sequences
         # e.g.[("FILE", half_files_1), ("FUNC", half_funcs_1), ("FILE", half_files_2), ...]
@@ -602,11 +606,6 @@ def reduce_files_and_functions(
                     print(f"[+] {msg}")
 
                     commit_hash = commit_change(apply_wt, msg)
-                    subprocess.run(
-                        ["git", "reset", "--hard", commit_hash],
-                        cwd=repo,
-                        capture_output=True,
-                    )
                     with latest_commit_lock:
                         latest_commit[0] = commit_hash
 
@@ -803,18 +802,13 @@ def truncate_files(
                 msg = f"reduce: truncate {len(all_files)} file(s): {names}"
                 print(f"[+] {msg}")
                 commit_hash = commit_change(apply_wt, msg)
-                subprocess.run(
-                    ["git", "reset", "--hard", commit_hash],
-                    cwd=repo,
-                    capture_output=True,
-                )
                 with latest_commit_lock:
                     latest_commit[0] = commit_hash
                 pending = []
             else:
-                restore_worktree(apply_wt)
                 n_discard = max(1, len(pending) // 2)
                 pending = pending[n_discard:]
+            restore_worktree(apply_wt)
 
     producer_threads = [
         threading.Thread(target=producer_worker, args=(producer_wts[i], i))
@@ -923,28 +917,19 @@ def reduce_empty_lines(
 
             names = ", ".join(all_files[:3]) + ("..." if len(all_files) > 3 else "")
 
-            if not _strip_empty_lines(apply_wt, all_files):
-                pending = []
-                continue
-
-            if run_test(cmd, apply_wt, dummy):
+            if _strip_empty_lines(apply_wt, all_files) and run_test(cmd, apply_wt, dummy):
                 msg = (
                     f"reduce: strip empty lines from {len(all_files)} file(s): {names}"
                 )
                 print(f"[+] {msg}")
                 commit_hash = commit_change(apply_wt, msg)
-                subprocess.run(
-                    ["git", "reset", "--hard", commit_hash],
-                    cwd=repo,
-                    capture_output=True,
-                )
                 with latest_commit_lock:
                     latest_commit[0] = commit_hash
                 pending = []
             else:
-                restore_worktree(apply_wt)
                 n_discard = max(1, len(pending) // 2)
                 pending = pending[n_discard:]
+            restore_worktree(apply_wt)
 
     producer_threads = [
         threading.Thread(target=producer_worker, args=(producer_wts[i], i))
@@ -1193,16 +1178,11 @@ def reduce_lines(
                         depth_changed_files.update(fp for fp, *_ in pending)
                         with latest_commit_lock:
                             latest_commit[0] = commit_hash
-                        subprocess.run(
-                            ["git", "reset", "--hard", commit_hash],
-                            cwd=repo,
-                            capture_output=True,
-                        )
                         pending = []
                     else:
-                        restore_worktree(apply_wt)
                         n_discard = max(1, len(pending) // 2)
                         pending = pending[n_discard:]
+                    restore_worktree(apply_wt)
 
             producer_threads = [
                 threading.Thread(target=producer_worker, args=(producer_wts[i], i))
