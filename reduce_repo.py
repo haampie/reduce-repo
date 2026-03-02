@@ -522,10 +522,10 @@ def reduce_files_and_functions(
 
                 pct = _dispatched[0] * 100 // _n_states
                 if kind == "FILE":
-                    print(f"  [worker {i}] ({pct:3d}%) try {len(files_to_del)} file(s)")
+                    print(f"  [worker {i}] ({pct:3d}%) try {len(files_to_del)} files")
                 else:
                     print(
-                        f"  [worker {i}] ({pct:3d}%) try {len(funcs_to_del)} func/call(s)"
+                        f"  [worker {i}] ({pct:3d}%) try {len(funcs_to_del)} functions/calls"
                     )
 
                 if _apply_deletions_to_wt(wt, files_to_del, funcs_to_del) and run_test(
@@ -608,11 +608,11 @@ def reduce_files_and_functions(
 
                 if skip_test:
                     print(
-                        f"[*] Applying verified deletions: {len(files_to_delete)} file(s), {len(funcs_to_delete)} func/call(s) (skip test)"
+                        f"[*] Applying verified deletions: {len(files_to_delete)} files, {len(funcs_to_delete)} functions/calls (skip test)"
                     )
                 else:
                     print(
-                        f"[*] Trying pending deletions: {len(files_to_delete)} file(s), {len(funcs_to_delete)} func/call(s)"
+                        f"[*] Trying pending deletions: {len(files_to_delete)} files, {len(funcs_to_delete)} functions/calls"
                     )
 
                 # Always apply deletions
@@ -626,32 +626,19 @@ def reduce_files_and_functions(
                 if test_passed:
                     parts = []
                     if files_to_delete:
-                        parts.append(f"{len(files_to_delete)} file(s)")
+                        parts.append(f"{len(files_to_delete)} files")
                         n_files_applied += 1
 
                     n_funcs = sum(1 for tag, *_ in funcs_to_delete if tag == "FUNC")
                     n_calls = sum(1 for tag, *_ in funcs_to_delete if tag == "CALL")
                     if n_funcs:
-                        parts.append(f"{n_funcs} function(s)")
+                        parts.append(f"{n_funcs} functions")
                     if n_calls:
-                        parts.append(f"{n_calls} call(s)")
+                        parts.append(f"{n_calls} calls")
                     if n_funcs or n_calls:
                         n_funcs_applied += 1
 
-                    all_affected_names = files_to_delete + sorted(
-                        {fp for _, fp, _, _ in funcs_to_delete}
-                    )
-                    seen_names = set()
-                    unique_names = [
-                        nm
-                        for nm in all_affected_names
-                        if not (nm in seen_names or seen_names.add(nm))
-                    ]
-                    names_str = ", ".join(unique_names[:3]) + (
-                        "..." if len(unique_names) > 3 else ""
-                    )
-
-                    msg = f"reduce: delete {' and '.join(parts)} in {names_str}"
+                    msg = f"reduce: delete {' and '.join(parts)}"
                     print(f"[+] {msg}")
 
                     commit_hash = commit_change(apply_wt, msg)
@@ -673,7 +660,11 @@ def reduce_files_and_functions(
                             min_successful_chunk_funcs, min(u_chunks)
                         )
                         restart_chunk_size_funcs[0] = min_successful_chunk_funcs * 2
-                    pending = []
+
+                    # If we picked a single matching item to avoid running tests, we shouldn't
+                    # clear the pending queue but try it next iteration.
+                    if matching_idx is not None:
+                        pending = []
 
                     # Trigger a restart signal after RETRY_AFTER consecutive successes
                     if n_files_applied >= RETRY_AFTER or n_funcs_applied >= RETRY_AFTER:
@@ -814,7 +805,7 @@ def truncate_files(
             if not batch:
                 continue
             pct = _dispatched[0] * 100 // _n_states
-            print(f"  [worker {i}] ({pct:3d}%) truncate {len(batch)} file(s)")
+            print(f"  [worker {i}] ({pct:3d}%) truncate {len(batch)} files")
             if _truncate_files(wt, batch) and run_test(cmd, wt, no_cancel):
                 patch_queue.put(batch)
             restore_worktree(wt)
@@ -842,14 +833,12 @@ def truncate_files(
                 pending = []
                 continue
 
-            names = ", ".join(all_files[:3]) + ("..." if len(all_files) > 3 else "")
-
             if not _truncate_files(apply_wt, all_files):
                 pending = []
                 continue
 
             if run_test(cmd, apply_wt, dummy):
-                msg = f"reduce: truncate {len(all_files)} file(s): {names}"
+                msg = f"reduce: truncate {len(all_files)} files"
                 print(f"[+] {msg}")
                 commit_hash = commit_change(apply_wt, msg)
                 with latest_commit_lock:
@@ -936,7 +925,7 @@ def reduce_empty_lines(
                 continue
             pct = _dispatched[0] * 100 // _n_states
             print(
-                f"  [worker {i}] ({pct:3d}%) strip empty lines from {len(batch)} file(s)"
+                f"  [worker {i}] ({pct:3d}%) strip empty lines from {len(batch)} files"
             )
             if _strip_empty_lines(wt, batch) and run_test(cmd, wt, no_cancel):
                 patch_queue.put(batch)
@@ -965,14 +954,10 @@ def reduce_empty_lines(
                 pending = []
                 continue
 
-            names = ", ".join(all_files[:3]) + ("..." if len(all_files) > 3 else "")
-
             if _strip_empty_lines(apply_wt, all_files) and run_test(
                 cmd, apply_wt, dummy
             ):
-                msg = (
-                    f"reduce: strip empty lines from {len(all_files)} file(s): {names}"
-                )
+                msg = f"reduce: strip empty lines from {len(all_files)} files"
                 print(f"[+] {msg}")
                 commit_hash = commit_change(apply_wt, msg)
                 with latest_commit_lock:
@@ -1195,7 +1180,7 @@ def reduce_lines(
 
                     pct = _dispatched[0] * 100 // _n_tasks
                     print(
-                        f"  [worker {i}] ({pct:3d}%) {filepath}: remove {removed} line(s) [{start}:{end}]"
+                        f"  [worker {i}] ({pct:3d}%) {filepath}: remove {removed} lines [{start}:{end}]"
                     )
                     (wt / filepath).write_text("".join(remaining))
 
@@ -1253,10 +1238,7 @@ def reduce_lines(
 
                     if run_test(cmd, apply_wt, dummy):
                         total = sum(r[3] for r in pending)
-                        parts = "; ".join(
-                            f"{fp} [{s}:{e}]" for fp, s, e, _, _ in pending
-                        )
-                        msg = f"reduce: {total} line(s) across {len(pending)} regions: {parts}"
+                        msg = f"reduce: {total} lines across {len(pending)} regions"
                         print(f"[+] {msg}")
                         commit_hash = commit_change(apply_wt, msg)
                         depth_applier_commits.append(commit_hash)
