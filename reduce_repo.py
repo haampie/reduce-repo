@@ -409,7 +409,10 @@ def reduce_files_and_functions(
 
         # Shuffle the calls in blocks of MIN_FUNC_CHUNK so we're likely to delete from multiple files instead
         # of all calls from the same file.
-        block_calls = [all_calls[i : i + MIN_FUNC_CHUNK] for i in range(0, len(all_calls), MIN_FUNC_CHUNK)]
+        block_calls = [
+            all_calls[i : i + MIN_FUNC_CHUNK]
+            for i in range(0, len(all_calls), MIN_FUNC_CHUNK)
+        ]
         random.shuffle(block_calls)
         all_calls = list(itertools.chain.from_iterable(block_calls))
 
@@ -432,13 +435,19 @@ def reduce_files_and_functions(
         states_funcs = [s for s in states_funcs if s.chunk >= MIN_FUNC_CHUNK]
 
         # Build an interleaved task queue of independent bisection sequences
-        # e.g.[("FILE", half_files_1), ("FUNC", half_funcs_1), ("FILE", half_files_2), ...]
+        # FILE, FILE, FILE, FUNC, FILE, FILE, FILE, FUNC, FILE, FILE, FILE, FUNC, ...
+        states_files.reverse()
+        states_funcs.reverse()
         tasks = []
-        for sf, su in itertools.zip_longest(states_files, states_funcs):
-            if sf is not None:
-                tasks.append(("FILE", sf))
-            if su is not None:
-                tasks.append(("FUNC", su))
+        while states_files or states_funcs:
+            if states_files:
+                tasks.append(("FILE", states_files.pop()))
+            if states_files:
+                tasks.append(("FILE", states_files.pop()))
+            if states_files:
+                tasks.append(("FILE", states_files.pop()))
+            if states_funcs:
+                tasks.append(("FUNC", states_funcs.pop()))
 
         if not tasks:
             break
@@ -516,7 +525,9 @@ def reduce_files_and_functions(
                 if _apply_deletions_to_wt(wt, files_to_del, funcs_to_del) and run_test(
                     cmd, wt, no_cancel
                 ):
-                    patch_queue.put((kind, files_to_del, funcs_to_del, s.chunk, my_commit))
+                    patch_queue.put(
+                        (kind, files_to_del, funcs_to_del, s.chunk, my_commit)
+                    )
 
                 restore_worktree(wt)
 
@@ -599,7 +610,9 @@ def reduce_files_and_functions(
                     )
 
                 # Always apply deletions
-                applied = _apply_deletions_to_wt(apply_wt, files_to_delete, funcs_to_delete)
+                applied = _apply_deletions_to_wt(
+                    apply_wt, files_to_delete, funcs_to_delete
+                )
 
                 # Test only if not skipping
                 test_passed = applied and (skip_test or run_test(cmd, apply_wt, dummy))
@@ -947,7 +960,9 @@ def reduce_empty_lines(
 
             names = ", ".join(all_files[:3]) + ("..." if len(all_files) > 3 else "")
 
-            if _strip_empty_lines(apply_wt, all_files) and run_test(cmd, apply_wt, dummy):
+            if _strip_empty_lines(apply_wt, all_files) and run_test(
+                cmd, apply_wt, dummy
+            ):
                 msg = (
                     f"reduce: strip empty lines from {len(all_files)} file(s): {names}"
                 )
