@@ -23,6 +23,9 @@ from itertools import groupby, dropwhile
 from pathlib import Path
 import time
 
+#: Number of consecutive successful reductions before restarting with larger chunk sizes.
+RETRY_AFTER = 8
+
 
 # ---------------------------------------------------------------------------
 # BinaryState - pure-functional, frozen, thread-safe
@@ -418,15 +421,11 @@ def reduce_files_and_functions(
         if N_files == 0 and N_funcs == 0:
             break
 
-        states_files = _get_states(N_files, next_start_chunk_files)
-        states_funcs = _get_states(N_funcs, next_start_chunk_funcs)
+        start_chunk_files = next_start_chunk_files
+        start_chunk_funcs = min(128, next_start_chunk_funcs or 128)
 
-        # Ensure that states_funcs starts with at most 512 items; otherwise it's unlikely to find
-        # successful reductions.
-        states_funcs = list(dropwhile(lambda s: s.chunk > 512, states_funcs))
-
-        next_start_chunk_files = None
-        next_start_chunk_funcs = None
+        states_files = _get_states(N_files, start_chunk_files)
+        states_funcs = _get_states(N_funcs, start_chunk_funcs)
 
         # Build an interleaved task queue of independent bisection sequences
         # e.g.[("FILE", half_files_1), ("FUNC", half_funcs_1), ("FILE", half_files_2), ...]
@@ -510,9 +509,10 @@ def reduce_files_and_functions(
                         f"  [worker {i}] ({pct:3d}%) try {len(funcs_to_del)} func/call(s)"
                     )
 
-                if _apply_deletions_to_wt(wt, files_to_del, funcs_to_del):
-                    if run_test(cmd, wt, no_cancel):
-                        patch_queue.put((kind, files_to_del, funcs_to_del, s.chunk))
+                if _apply_deletions_to_wt(wt, files_to_del, funcs_to_del) and run_test(
+                    cmd, wt, no_cancel
+                ):
+                    patch_queue.put((kind, files_to_del, funcs_to_del, s.chunk))
 
                 restore_worktree(wt)
 
@@ -568,13 +568,9 @@ def reduce_files_and_functions(
                     f"[*] Trying pending deletions: {len(files_to_delete)} file(s), {len(funcs_to_delete)} func/call(s)"
                 )
 
-                if not _apply_deletions_to_wt(
+                if _apply_deletions_to_wt(
                     apply_wt, files_to_delete, funcs_to_delete
-                ):
-                    pending = []
-                    continue
-
-                if run_test(cmd, apply_wt, dummy):
+                ) and run_test(cmd, apply_wt, dummy):
                     parts = []
                     if files_to_delete:
                         parts.append(f"{len(files_to_delete)} file(s)")
@@ -620,26 +616,24 @@ def reduce_files_and_functions(
                         min_successful_chunk_files = min(
                             min_successful_chunk_files, min(f_chunks)
                         )
+                        restart_chunk_size_files[0] = min_successful_chunk_files * 2
 
                     u_chunks = [c for k, c in pending_meta if k == "FUNC"]
                     if u_chunks:
                         min_successful_chunk_funcs = min(
                             min_successful_chunk_funcs, min(u_chunks)
                         )
-
+                        restart_chunk_size_funcs[0] = min_successful_chunk_funcs * 2
                     pending = []
 
-                    # Trigger a restart signal after 4 consecutive successes
-                    if n_files_applied >= 4:
-                        restart_chunk_size_files[0] = min_successful_chunk_files * 2
-                    if n_funcs_applied >= 4:
-                        restart_chunk_size_funcs[0] = min_successful_chunk_funcs * 2
-                    if n_files_applied >= 4 or n_funcs_applied >= 4:
+                    # Trigger a restart signal after RETRY_AFTER consecutive successes
+                    if n_files_applied >= RETRY_AFTER or n_funcs_applied >= RETRY_AFTER:
                         restart_event.set()
                 else:
-                    restore_worktree(apply_wt)
                     n_discard = max(1, len(pending) // 2)
                     pending = pending[n_discard:]
+
+                restore_worktree(apply_wt)
 
         producer_threads = [
             threading.Thread(target=producer_worker, args=(producer_wts[i], i))
