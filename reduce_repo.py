@@ -651,6 +651,7 @@ def reduce_files_and_functions(
                     commit_hash = commit_change(apply_wt, msg)
                     with latest_commit_lock:
                         latest_commit[0] = commit_hash
+                    sync_worktrees_to_commit(latest_commit[0], [repo])
 
                     # Calculate new min chunks by kind
                     f_chunks = [c for k, c in pending_meta if k == "FILE"]
