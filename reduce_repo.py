@@ -48,7 +48,9 @@ class BinaryState:
         # Walk backwards within the current chunk size (end -> start).
         if self.index >= self.chunk:
             return BinaryState(
-                instances=self.instances, chunk=self.chunk, index=self.index - self.chunk
+                instances=self.instances,
+                chunk=self.chunk,
+                index=self.index - self.chunk,
             )
         # Exhausted this chunk size: halve and start from the last chunk.
         next_chunk = self.chunk // 2
@@ -102,7 +104,9 @@ def git_ls_files(repo: Path) -> list[str]:
     # Sort so that files in the same directory are contiguous. Binary-search
     # chunks then tend to cover whole directories, making early deletions more
     # likely to be interesting.
-    return sorted(f for f in result.stdout.splitlines() if f and Path(f).name != ".gitignore")
+    return sorted(
+        f for f in result.stdout.splitlines() if f and Path(f).name != ".gitignore"
+    )
 
 
 def create_worktrees(repo: Path, n: int, parent: Path) -> list[Path]:
@@ -150,12 +154,17 @@ def sync_worktrees_to_commit(commit: str, worktrees: list[Path]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_test(cmd: str, wt: Path, stop_event: threading.Event, verbose: bool = False) -> bool:
+def run_test(
+    cmd: str, wt: Path, stop_event: threading.Event, verbose: bool = False
+) -> bool:
     """Run the interestingness test in wt. Return True if interesting (exit 0).
 
     Polls stop_event every 50ms and terminates the subprocess early if set.
     """
-    with tempfile.TemporaryFile(mode='w+b') as stdout_f, tempfile.TemporaryFile(mode='w+b') as stderr_f:
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_f,
+        tempfile.TemporaryFile(mode="w+b") as stderr_f,
+    ):
         start = time.monotonic()  # ensure monotonic time for timeout
         proc = subprocess.Popen(
             cmd,
@@ -176,7 +185,7 @@ def run_test(cmd: str, wt: Path, stop_event: threading.Event, verbose: bool = Fa
                     except subprocess.TimeoutExpired:
                         proc.kill()
                     return False
-                
+
         passed = proc.returncode == 0
 
         if passed or verbose:
@@ -192,13 +201,13 @@ def run_test(cmd: str, wt: Path, stop_event: threading.Event, verbose: bool = Fa
                 msg.append(f"STDOUT:\n{out}\n")
             if err:
                 msg.append(f"STDERR:\n{err}\n")
-            msg.append(f"\n--- [{'SUCCESS' if passed else 'FAILURE'}] Test passed in {wt.name} in {time.monotonic() - start:.2f}s ---")
+            msg.append(
+                f"\n--- [{'SUCCESS' if passed else 'FAILURE'}] Test passed in {wt.name} in {time.monotonic() - start:.2f}s ---"
+            )
 
             # Print strictly one message at a time to avoid garbled text
             print("\n".join(msg), flush=True)
         return passed
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +295,9 @@ def _collect_funcs_and_calls(
     while stack:
         node = stack.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            first_line = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            first_line = (
+                node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            )
             end = node.end_lineno
             while end < len(lines_list) and not lines_list[end].strip():
                 end += 1
@@ -300,7 +311,9 @@ def _collect_funcs_and_calls(
     return function_defs, function_calls
 
 
-def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> None:
+def reduce_files_and_functions(
+    files: list[str], repo: Path, worktrees: list[Path], cmd: str
+) -> None:
     """Delete function definitions and bare call statements until no further reduction is possible."""
     apply_wt = worktrees[-1]
     producer_wts = worktrees[:-1]
@@ -312,9 +325,7 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
     next_start_chunk_funcs = None
 
     def _apply_deletions_to_wt(
-        wt: Path,
-        files_to_del: list[str],
-        funcs_to_del: list[tuple[str, str, int, int]]
+        wt: Path, files_to_del: list[str], funcs_to_del: list[tuple[str, str, int, int]]
     ) -> bool:
         """Apply both file and function deletions; return True if changed."""
         changed = False
@@ -330,7 +341,7 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
             for tag, fp, s, e in funcs_to_del:
                 if fp in files_to_del:
                     continue  # skip modifying a file that we are deleting entirely
-                by_file.setdefault(fp,[]).append((s, e))
+                by_file.setdefault(fp, []).append((s, e))
 
             for fp, intervals in by_file.items():
                 full_path = wt / fp
@@ -348,7 +359,7 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
 
     def _get_states(N: int, next_sc: int | None) -> list[BinaryState]:
         if N == 0:
-            return[]
+            return []
         sc = min(next_sc, N) if next_sc else N
         if sc >= N:
             state = BinaryState.create(N)
@@ -356,9 +367,8 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
             last_idx = ((N - 1) // sc) * sc
             state = BinaryState(instances=N, chunk=sc, index=last_idx)
         if state is None:
-            return[]
+            return []
         return list(_state_iter(state))
-
 
     while True:
         # Rotate files for fairness round-over-round
@@ -368,8 +378,8 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
             files = files[rot:] + files[:rot]
 
         current_files = []
-        all_defs =[]
-        all_calls =[]
+        all_defs = []
+        all_calls = []
 
         # Re-parse existing ASTs on remaining files
         for filepath in files:
@@ -393,13 +403,15 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
 
         # Shuffle the calls in blocks of 4 so we're likely to delete from multiple files instead
         # of all calls from the same file.
-        block_calls = [all_calls[i:i+4] for i in range(0, len(all_calls), 4)]
+        block_calls = [all_calls[i : i + 4] for i in range(0, len(all_calls), 4)]
         random.shuffle(block_calls)
         all_calls = list(itertools.chain.from_iterable(block_calls))
 
         files = current_files
-        funcs_items = [("FUNC", *t) for t in all_defs] +[("CALL", *t) for t in all_calls]
-        
+        funcs_items = [("FUNC", *t) for t in all_defs] + [
+            ("CALL", *t) for t in all_calls
+        ]
+
         N_files = len(files)
         N_funcs = len(funcs_items)
 
@@ -418,7 +430,7 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
 
         # Build an interleaved task queue of independent bisection sequences
         # e.g.[("FILE", half_files_1), ("FUNC", half_funcs_1), ("FILE", half_files_2), ...]
-        tasks =[]
+        tasks = []
         for sf, su in itertools.zip_longest(states_files, states_funcs):
             if sf is not None:
                 tasks.append(("FILE", sf))
@@ -444,11 +456,11 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
                 return task
 
         initial_commit = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
-        latest_commit: list[str] =[initial_commit]
+        latest_commit: list[str] = [initial_commit]
         latest_commit_lock = threading.Lock()
         patch_queue: queue.Queue = queue.Queue()
         producers_done = threading.Event()
-        
+
         restart_chunk_size_files = [None]
         restart_chunk_size_funcs = [None]
 
@@ -460,22 +472,32 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
                     lc = latest_commit[0]
                 if lc != my_commit:
                     if my_commit is not None:
-                        subprocess.run(["git", "reset", "--hard", lc], cwd=wt, capture_output=True)
+                        subprocess.run(
+                            ["git", "reset", "--hard", lc], cwd=wt, capture_output=True
+                        )
                     my_commit = lc
-                subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
+                subprocess.run(
+                    ["git", "clean", "-fdx", "."], cwd=wt, capture_output=True
+                )
 
                 task = _next()
                 if task is None:
                     return
-                
+
                 kind, s = task
-                files_to_del =[]
+                files_to_del = []
                 funcs_to_del = []
 
                 if kind == "FILE":
-                    files_to_del =[f for f in files[s.index : s.end()] if (wt / f).exists()]
+                    files_to_del = [
+                        f for f in files[s.index : s.end()] if (wt / f).exists()
+                    ]
                 else:
-                    funcs_to_del = [x for x in funcs_items[s.index : s.end()] if (wt / x[1]).exists()]
+                    funcs_to_del = [
+                        x
+                        for x in funcs_items[s.index : s.end()]
+                        if (wt / x[1]).exists()
+                    ]
 
                 if not files_to_del and not funcs_to_del:
                     continue
@@ -484,7 +506,9 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
                 if kind == "FILE":
                     print(f"  [worker {i}] ({pct:3d}%) try {len(files_to_del)} file(s)")
                 else:
-                    print(f"  [worker {i}] ({pct:3d}%) try {len(funcs_to_del)} func/call(s)")
+                    print(
+                        f"  [worker {i}] ({pct:3d}%) try {len(funcs_to_del)} func/call(s)"
+                    )
 
                 if _apply_deletions_to_wt(wt, files_to_del, funcs_to_del):
                     if run_test(cmd, wt, no_cancel):
@@ -494,14 +518,14 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
 
         def applier_worker():
             # pending contents: (kind, files_to_del, funcs_to_del, chunk_size)
-            pending =[]
+            pending = []
             dummy = threading.Event()
-            
+
             min_successful_chunk_files = N_files
             min_successful_chunk_funcs = N_funcs
             n_files_applied = 0
             n_funcs_applied = 0
-            
+
             while True:
                 try:
                     while True:
@@ -516,13 +540,18 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
                     continue
 
                 # Accumulate deletions from the pending items
-                files_to_delete = sorted({
-                    f for _, p_files, _, _ in pending for f in p_files if (apply_wt / f).exists()
-                })
-                
+                files_to_delete = sorted(
+                    {
+                        f
+                        for _, p_files, _, _ in pending
+                        for f in p_files
+                        if (apply_wt / f).exists()
+                    }
+                )
+
                 funcs_to_delete = []
                 seen_funcs = set()
-                pending_meta =[] # keep track of successful kinds and their chunk sizes
+                pending_meta = []  # keep track of successful kinds and their chunk sizes
 
                 for p_kind, _, p_funcs, p_chunk in pending:
                     pending_meta.append((p_kind, p_chunk))
@@ -532,51 +561,73 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
                             funcs_to_delete.append((tag, fp, s, e))
 
                 if not files_to_delete and not funcs_to_delete:
-                    pending =[]
+                    pending = []
                     continue
 
-                print(f"[*] Trying pending deletions: {len(files_to_delete)} file(s), {len(funcs_to_delete)} func/call(s)")
+                print(
+                    f"[*] Trying pending deletions: {len(files_to_delete)} file(s), {len(funcs_to_delete)} func/call(s)"
+                )
 
-                if not _apply_deletions_to_wt(apply_wt, files_to_delete, funcs_to_delete):
-                    pending =[]
+                if not _apply_deletions_to_wt(
+                    apply_wt, files_to_delete, funcs_to_delete
+                ):
+                    pending = []
                     continue
 
                 if run_test(cmd, apply_wt, dummy):
-                    parts =[]
+                    parts = []
                     if files_to_delete:
                         parts.append(f"{len(files_to_delete)} file(s)")
                         n_files_applied += 1
-                    
+
                     n_funcs = sum(1 for tag, *_ in funcs_to_delete if tag == "FUNC")
                     n_calls = sum(1 for tag, *_ in funcs_to_delete if tag == "CALL")
-                    if n_funcs: parts.append(f"{n_funcs} function(s)")
-                    if n_calls: parts.append(f"{n_calls} call(s)")
+                    if n_funcs:
+                        parts.append(f"{n_funcs} function(s)")
+                    if n_calls:
+                        parts.append(f"{n_calls} call(s)")
                     if n_funcs or n_calls:
                         n_funcs_applied += 1
 
-                    all_affected_names = files_to_delete + sorted({fp for _, fp, _, _ in funcs_to_delete})
+                    all_affected_names = files_to_delete + sorted(
+                        {fp for _, fp, _, _ in funcs_to_delete}
+                    )
                     seen_names = set()
-                    unique_names =[nm for nm in all_affected_names if not (nm in seen_names or seen_names.add(nm))]
-                    names_str = ", ".join(unique_names[:3]) + ("..." if len(unique_names) > 3 else "")
+                    unique_names = [
+                        nm
+                        for nm in all_affected_names
+                        if not (nm in seen_names or seen_names.add(nm))
+                    ]
+                    names_str = ", ".join(unique_names[:3]) + (
+                        "..." if len(unique_names) > 3 else ""
+                    )
 
                     msg = f"reduce: delete {' and '.join(parts)} in {names_str}"
                     print(f"[+] {msg}")
 
                     commit_hash = commit_change(apply_wt, msg)
-                    subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
+                    subprocess.run(
+                        ["git", "reset", "--hard", commit_hash],
+                        cwd=repo,
+                        capture_output=True,
+                    )
                     with latest_commit_lock:
                         latest_commit[0] = commit_hash
 
                     # Calculate new min chunks by kind
                     f_chunks = [c for k, c in pending_meta if k == "FILE"]
                     if f_chunks:
-                        min_successful_chunk_files = min(min_successful_chunk_files, min(f_chunks))
-                        
-                    u_chunks =[c for k, c in pending_meta if k == "FUNC"]
-                    if u_chunks:
-                        min_successful_chunk_funcs = min(min_successful_chunk_funcs, min(u_chunks))
+                        min_successful_chunk_files = min(
+                            min_successful_chunk_files, min(f_chunks)
+                        )
 
-                    pending =[]
+                    u_chunks = [c for k, c in pending_meta if k == "FUNC"]
+                    if u_chunks:
+                        min_successful_chunk_funcs = min(
+                            min_successful_chunk_funcs, min(u_chunks)
+                        )
+
+                    pending = []
 
                     # Trigger a restart signal after 4 consecutive successes
                     if n_files_applied >= 4:
@@ -595,11 +646,13 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
             for i in range(n_producers)
         ]
         applier_thread = threading.Thread(target=applier_worker)
-        
-        for t in producer_threads: t.start()
+
+        for t in producer_threads:
+            t.start()
         applier_thread.start()
-        
-        for t in producer_threads: t.join()
+
+        for t in producer_threads:
+            t.join()
         producers_done.set()
         applier_thread.join()
 
@@ -615,6 +668,7 @@ def reduce_files_and_functions(files: list[str], repo: Path, worktrees: list[Pat
             break
 
     return files
+
 
 # ---------------------------------------------------------------------------
 # Phase 1.75: reduce empty lines
@@ -660,7 +714,9 @@ def _truncate_files(wt: Path, batch: list[str]) -> bool:
     return changed
 
 
-def truncate_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> None:
+def truncate_files(
+    files: list[str], repo: Path, worktrees: list[Path], cmd: str
+) -> None:
     """Truncate files to empty content until no further reduction is possible."""
     apply_wt = worktrees[-1]
     producer_wts = worktrees[:-1]
@@ -668,7 +724,9 @@ def truncate_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str
     assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
     ref_wt = worktrees[0]
 
-    targets = [f for f in files if (ref_wt / f).exists() and (ref_wt / f).stat().st_size > 0]
+    targets = [
+        f for f in files if (ref_wt / f).exists() and (ref_wt / f).stat().st_size > 0
+    ]
     state = BinaryState.create(len(targets))
     if state is None:
         return
@@ -700,14 +758,16 @@ def truncate_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str
                 lc = latest_commit[0]
             if lc != my_commit:
                 if my_commit is not None:
-                    subprocess.run(["git", "reset", "--hard", lc], cwd=wt, capture_output=True)
+                    subprocess.run(
+                        ["git", "reset", "--hard", lc], cwd=wt, capture_output=True
+                    )
                 my_commit = lc
             subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
 
             s = _next()
             if s is None:
                 return
-            batch = [f for f in targets[s.index:s.end()] if (wt / f).exists()]
+            batch = [f for f in targets[s.index : s.end()] if (wt / f).exists()]
             if not batch:
                 continue
             pct = _dispatched[0] * 100 // _n_states
@@ -732,7 +792,9 @@ def truncate_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str
                 time.sleep(0.05)
                 continue
 
-            all_files = sorted({f for batch in pending for f in batch if (apply_wt / f).exists()})
+            all_files = sorted(
+                {f for batch in pending for f in batch if (apply_wt / f).exists()}
+            )
             if not all_files:
                 pending = []
                 continue
@@ -747,7 +809,11 @@ def truncate_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str
                 msg = f"reduce: truncate {len(all_files)} file(s): {names}"
                 print(f"[+] {msg}")
                 commit_hash = commit_change(apply_wt, msg)
-                subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
+                subprocess.run(
+                    ["git", "reset", "--hard", commit_hash],
+                    cwd=repo,
+                    capture_output=True,
+                )
                 with latest_commit_lock:
                     latest_commit[0] = commit_hash
                 pending = []
@@ -774,7 +840,9 @@ def truncate_files(files: list[str], repo: Path, worktrees: list[Path], cmd: str
         sync_worktrees_to_commit(latest_commit[0], [repo] + worktrees)
 
 
-def reduce_empty_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str) -> None:
+def reduce_empty_lines(
+    files: list[str], repo: Path, worktrees: list[Path], cmd: str
+) -> None:
     """Remove empty/whitespace-only lines from files until no further reduction is possible."""
     apply_wt = worktrees[-1]
     producer_wts = worktrees[:-1]
@@ -782,7 +850,9 @@ def reduce_empty_lines(files: list[str], repo: Path, worktrees: list[Path], cmd:
     assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
     ref_wt = worktrees[0]
 
-    targets = [f for f in files if (ref_wt / f).exists() and _has_empty_lines(ref_wt / f)]
+    targets = [
+        f for f in files if (ref_wt / f).exists() and _has_empty_lines(ref_wt / f)
+    ]
     state = BinaryState.create(len(targets))
     if state is None:
         return
@@ -814,18 +884,22 @@ def reduce_empty_lines(files: list[str], repo: Path, worktrees: list[Path], cmd:
                 lc = latest_commit[0]
             if lc != my_commit:
                 if my_commit is not None:
-                    subprocess.run(["git", "reset", "--hard", lc], cwd=wt, capture_output=True)
+                    subprocess.run(
+                        ["git", "reset", "--hard", lc], cwd=wt, capture_output=True
+                    )
                 my_commit = lc
             subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
 
             s = _next()
             if s is None:
                 return
-            batch = [f for f in targets[s.index:s.end()] if (wt / f).exists()]
+            batch = [f for f in targets[s.index : s.end()] if (wt / f).exists()]
             if not batch:
                 continue
             pct = _dispatched[0] * 100 // _n_states
-            print(f"  [worker {i}] ({pct:3d}%) strip empty lines from {len(batch)} file(s)")
+            print(
+                f"  [worker {i}] ({pct:3d}%) strip empty lines from {len(batch)} file(s)"
+            )
             if _strip_empty_lines(wt, batch) and run_test(cmd, wt, no_cancel):
                 patch_queue.put(batch)
             restore_worktree(wt)
@@ -846,7 +920,9 @@ def reduce_empty_lines(files: list[str], repo: Path, worktrees: list[Path], cmd:
                 time.sleep(0.05)
                 continue
 
-            all_files = sorted({f for batch in pending for f in batch if (apply_wt / f).exists()})
+            all_files = sorted(
+                {f for batch in pending for f in batch if (apply_wt / f).exists()}
+            )
             if not all_files:
                 pending = []
                 continue
@@ -858,10 +934,16 @@ def reduce_empty_lines(files: list[str], repo: Path, worktrees: list[Path], cmd:
                 continue
 
             if run_test(cmd, apply_wt, dummy):
-                msg = f"reduce: strip empty lines from {len(all_files)} file(s): {names}"
+                msg = (
+                    f"reduce: strip empty lines from {len(all_files)} file(s): {names}"
+                )
                 print(f"[+] {msg}")
                 commit_hash = commit_change(apply_wt, msg)
-                subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
+                subprocess.run(
+                    ["git", "reset", "--hard", commit_hash],
+                    cwd=repo,
+                    capture_output=True,
+                )
                 with latest_commit_lock:
                     latest_commit[0] = commit_hash
                 pending = []
@@ -893,7 +975,14 @@ def reduce_empty_lines(files: list[str], repo: Path, worktrees: list[Path], cmd:
 # ---------------------------------------------------------------------------
 
 
-def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, jitter: float = 0.05, min_chunk_size: int = 1) -> None:
+def reduce_lines(
+    files: list[str],
+    repo: Path,
+    worktrees: list[Path],
+    cmd: str,
+    jitter: float = 0.05,
+    min_chunk_size: int = 1,
+) -> None:
     """Delete lines within files until no further reduction is possible.
 
     Uses depth-major ordering: all files are processed at depth 0 (whole-file
@@ -913,7 +1002,7 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
     """
     n = len(worktrees)
     ref_wt = worktrees[0]
-    apply_wt = worktrees[-1]       # dedicated applier worktree
+    apply_wt = worktrees[-1]  # dedicated applier worktree
     producer_wts = worktrees[:-1]  # n-1 producer worktrees
     n_producers = len(producer_wts)
     assert n_producers >= 1, "Need at least 2 worktrees (-n >= 2)"
@@ -937,7 +1026,9 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
             break
 
         # Sort files largest-first so the most impactful deletions appear first.
-        sorted_files = sorted(file_lines, key=lambda fp: len(file_lines[fp]), reverse=True)
+        sorted_files = sorted(
+            file_lines, key=lambda fp: len(file_lines[fp]), reverse=True
+        )
 
         # Use the largest file as the reference for chunk sizes so every depth round
         # has a single chunk granularity.  Files smaller than the current chunk are
@@ -973,7 +1064,9 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                 states: list[BinaryState] = []
                 for k_start in range(last_start, -1, -stride):
                     s = BinaryState(instances=n, chunk=chunk_size, index=k_start)
-                    if (s.end() - k_start) * 2 >= chunk_size:   # same filter as _state_iter
+                    if (
+                        s.end() - k_start
+                    ) * 2 >= chunk_size:  # same filter as _state_iter
                         states.append(s)
                 groups.append(states)
             file_depth_groups[filepath] = groups
@@ -1036,9 +1129,15 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                         lc = latest_commit[0]
                     if lc != my_commit:
                         if my_commit is not None:
-                            subprocess.run(["git", "reset", "--hard", lc], cwd=wt, capture_output=True)
+                            subprocess.run(
+                                ["git", "reset", "--hard", lc],
+                                cwd=wt,
+                                capture_output=True,
+                            )
                         my_commit = lc
-                    subprocess.run(["git", "clean", "-fdx", "."], cwd=wt, capture_output=True)
+                    subprocess.run(
+                        ["git", "clean", "-fdx", "."], cwd=wt, capture_output=True
+                    )
 
                     task = _next_task()
                     if task is None:
@@ -1047,7 +1146,9 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                     remaining = lines[:start] + lines[end:]
                     removed = end - start
                     pct = _dispatched[0] * 100 // _n_tasks
-                    print(f"  [worker {i}] ({pct:3d}%) {filepath}: remove {removed} line(s) [{start}:{end}]")
+                    print(
+                        f"  [worker {i}] ({pct:3d}%) {filepath}: remove {removed} line(s) [{start}:{end}]"
+                    )
                     (wt / filepath).write_text("".join(remaining))
                     if run_test(cmd, wt, no_cancel):
                         patch_queue.put((filepath, start, end, removed, lines))
@@ -1088,7 +1189,9 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
 
                     if run_test(cmd, apply_wt, dummy):
                         total = sum(r[3] for r in pending)
-                        parts = "; ".join(f"{fp} [{s}:{e}]" for fp, s, e, _, _ in pending)
+                        parts = "; ".join(
+                            f"{fp} [{s}:{e}]" for fp, s, e, _, _ in pending
+                        )
                         msg = f"reduce: {total} line(s) across {len(pending)} regions: {parts}"
                         print(f"[+] {msg}")
                         commit_hash = commit_change(apply_wt, msg)
@@ -1096,7 +1199,11 @@ def reduce_lines(files: list[str], repo: Path, worktrees: list[Path], cmd: str, 
                         depth_changed_files.update(fp for fp, *_ in pending)
                         with latest_commit_lock:
                             latest_commit[0] = commit_hash
-                        subprocess.run(["git", "reset", "--hard", commit_hash], cwd=repo, capture_output=True)
+                        subprocess.run(
+                            ["git", "reset", "--hard", commit_hash],
+                            cwd=repo,
+                            capture_output=True,
+                        )
                         pending = []
                     else:
                         restore_worktree(apply_wt)
@@ -1239,7 +1346,9 @@ def main() -> None:
                 cycle += 1
                 head_before = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
 
-                print(f"\n[*] Phase 1 (cycle {cycle}): reducing files, functions and calls...")
+                print(
+                    f"\n[*] Phase 1 (cycle {cycle}): reducing files, functions and calls..."
+                )
                 reduce_files_and_functions(files, repo, worktrees, cmd)
                 print("[*] Phase 1 done.")
 
@@ -1252,8 +1361,14 @@ def main() -> None:
                 print("[*] Phase 1.75 done.")
 
                 print(f"\n[*] Phase 2 (cycle {cycle}): reducing lines...")
-                reduce_lines(files, repo, worktrees, cmd, jitter=args.jitter,
-                             min_chunk_size=16 if cycle == 1 else 1)  # coarse first pass; fine-grained on cycle 2+
+                reduce_lines(
+                    files,
+                    repo,
+                    worktrees,
+                    cmd,
+                    jitter=args.jitter,
+                    min_chunk_size=16 if cycle == 1 else 1,
+                )  # coarse first pass; fine-grained on cycle 2+
                 print("[*] Phase 2 done.")
 
                 head_after = git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()

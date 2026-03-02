@@ -44,7 +44,9 @@ def test_method_body_excluded():
         call_lines.update(range(s, e))
     for i, line in enumerate(source.splitlines()):
         if "inner_call()" in line or "method_call()" in line:
-            assert i not in call_lines, f"Line {i} ({line!r}) should not be collected as a call"
+            assert i not in call_lines, (
+                f"Line {i} ({line!r}) should not be collected as a call"
+            )
 
 
 def test_partition_order():

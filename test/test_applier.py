@@ -4,7 +4,7 @@ import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 from reduce_repo import _apply_deletions
 
-LINES = ["a\n", "b\n", "c\n", "d\n", "e\n"]   # indices 0-4
+LINES = ["a\n", "b\n", "c\n", "d\n", "e\n"]  # indices 0-4
 
 
 def test_non_overlapping():
@@ -28,7 +28,7 @@ def test_out_of_bounds_end():
 
 
 def test_invalid_interval_skipped():
-    assert _apply_deletions(LINES, [(3, 2)]) == LINES   # s >= e -> no-op
+    assert _apply_deletions(LINES, [(3, 2)]) == LINES  # s >= e -> no-op
 
 
 def test_empty_intervals():
