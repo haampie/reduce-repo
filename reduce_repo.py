@@ -516,12 +516,12 @@ def reduce_files_and_functions(
                 if _apply_deletions_to_wt(wt, files_to_del, funcs_to_del) and run_test(
                     cmd, wt, no_cancel
                 ):
-                    patch_queue.put((kind, files_to_del, funcs_to_del, s.chunk))
+                    patch_queue.put((kind, files_to_del, funcs_to_del, s.chunk, my_commit))
 
                 restore_worktree(wt)
 
         def applier_worker():
-            # pending contents: (kind, files_to_del, funcs_to_del, chunk_size)
+            # pending contents: (kind, files_to_del, funcs_to_del, chunk_size, commit_hash)
             pending = []
             dummy = threading.Event()
 
@@ -543,11 +543,32 @@ def reduce_files_and_functions(
                     time.sleep(0.05)
                     continue
 
-                # Accumulate deletions from the pending items
+                # Get current commit
+                current_commit = git(["rev-parse", "HEAD"], cwd=apply_wt).stdout.strip()
+
+                # Check if any pending item matches our current commit
+                matching_idx = None
+                skip_test = False
+                for idx, (_, _, _, _, p_commit) in enumerate(pending):
+                    if p_commit == current_commit:
+                        matching_idx = idx
+                        skip_test = True
+                        break
+
+                # Define pending_subset: either single matched item or all pending items
+                if matching_idx is not None:
+                    # Extract the matching item and remove it from pending
+                    matched_item = pending.pop(matching_idx)
+                    pending_subset = [matched_item]
+                else:
+                    # Process all pending items
+                    pending_subset = pending
+
+                # Accumulate deletions from pending_subset
                 files_to_delete = sorted(
                     {
                         f
-                        for _, p_files, _, _ in pending
+                        for _, p_files, _, _, _ in pending_subset
                         for f in p_files
                         if (apply_wt / f).exists()
                     }
@@ -557,7 +578,7 @@ def reduce_files_and_functions(
                 seen_funcs = set()
                 pending_meta = []  # keep track of successful kinds and their chunk sizes
 
-                for p_kind, _, p_funcs, p_chunk in pending:
+                for p_kind, _, p_funcs, p_chunk, _ in pending_subset:
                     pending_meta.append((p_kind, p_chunk))
                     for tag, fp, s, e in p_funcs:
                         if (apply_wt / fp).exists() and (fp, s, e) not in seen_funcs:
@@ -568,13 +589,22 @@ def reduce_files_and_functions(
                     pending = []
                     continue
 
-                print(
-                    f"[*] Trying pending deletions: {len(files_to_delete)} file(s), {len(funcs_to_delete)} func/call(s)"
-                )
+                if skip_test:
+                    print(
+                        f"[*] Applying verified deletions: {len(files_to_delete)} file(s), {len(funcs_to_delete)} func/call(s) (skip test)"
+                    )
+                else:
+                    print(
+                        f"[*] Trying pending deletions: {len(files_to_delete)} file(s), {len(funcs_to_delete)} func/call(s)"
+                    )
 
-                if _apply_deletions_to_wt(
-                    apply_wt, files_to_delete, funcs_to_delete
-                ) and run_test(cmd, apply_wt, dummy):
+                # Always apply deletions
+                applied = _apply_deletions_to_wt(apply_wt, files_to_delete, funcs_to_delete)
+
+                # Test only if not skipping
+                test_passed = applied and (skip_test or run_test(cmd, apply_wt, dummy))
+
+                if test_passed:
                     parts = []
                     if files_to_delete:
                         parts.append(f"{len(files_to_delete)} file(s)")
