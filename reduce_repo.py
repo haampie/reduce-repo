@@ -418,7 +418,7 @@ def reduce_files_and_functions(
             all_calls.extend(calls)
 
         # Sort calls by function name to group related calls together for more effective deletion.
-        all_calls.sort(key=lambda c: c[3])
+        all_calls.sort(key=lambda c: c[3], reverse=True)
         # Drop the function name; rest of the code expects 3-tuples.
         all_calls = [(fp, s, e) for fp, s, e, _ in all_calls]
 
